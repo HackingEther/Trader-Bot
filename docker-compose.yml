@@ -1,0 +1,74 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: trader
+      POSTGRES_PASSWORD: trader
+      POSTGRES_DB: trader
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trader"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  app:
+    build: .
+    env_file: .env
+    ports:
+      - "8000:8000"
+      - "9090:9090"
+    volumes:
+      - artifacts:/app/artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      uvicorn trader.main:app --host 0.0.0.0 --port 8000 --reload
+
+  worker:
+    build: .
+    env_file: .env
+    volumes:
+      - artifacts:/app/artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A trader.celery_app:celery worker --loglevel=info --concurrency=4
+
+  beat:
+    build: .
+    env_file: .env
+    volumes:
+      - artifacts:/app/artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A trader.celery_app:celery beat --loglevel=info
+
+volumes:
+  pgdata:
+  artifacts:
