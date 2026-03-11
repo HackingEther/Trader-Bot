@@ -188,8 +188,8 @@ class ExecutionEngine:
             child_type = str(leg.get("order_type") or "market")
             child_metadata = {
                 **leg,
-                "parent_order_id": parent_order.broker_order_id,
-                "reference_price": parent_order.rationale.get("reference_price"),
+                "parent_order_id": broker_order.broker_order_id,
+                "reference_price": (parent_order.rationale or {}).get("reference_price"),
             }
             await self._repo.create_idempotent(
                 idempotency_key=f"broker-child:{leg_id}",
