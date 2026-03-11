@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import queue
 import uuid
 
 import structlog
@@ -19,7 +20,13 @@ logger = structlog.get_logger(__name__)
 
 
 class IngestionManager:
-    """Orchestrates market data ingestion with reconnection and staleness detection."""
+    """Orchestrates market data ingestion with reconnection and staleness detection.
+
+    Uses thread-safe queues to marshal bar/quote/trade events from the provider's
+    callback thread into the main event loop, avoiding "Lock bound to different
+    event loop" errors when the provider (e.g. Alpaca) runs its websocket in a
+    separate thread.
+    """
 
     def __init__(
         self,
@@ -45,9 +52,16 @@ class IngestionManager:
         self._lease_name = f"ingestion:{type(provider).__name__}:{','.join(sorted(symbols))}"
         self._lease_owner = str(uuid.uuid4())
 
+        self._bar_queue: queue.Queue = queue.Queue(maxsize=2000)
+        self._quote_queue: queue.Queue = queue.Queue(maxsize=5000)
+        self._trade_queue: queue.Queue = queue.Queue(maxsize=5000)
+
         self._running = False
         self._staleness_task: asyncio.Task | None = None  # type: ignore[type-arg]
         self._lease_task: asyncio.Task | None = None  # type: ignore[type-arg]
+        self._bar_consumer_task: asyncio.Task | None = None  # type: ignore[type-arg]
+        self._quote_consumer_task: asyncio.Task | None = None  # type: ignore[type-arg]
+        self._trade_consumer_task: asyncio.Task | None = None  # type: ignore[type-arg]
         self._callbacks_registered = False
 
     @property
@@ -73,6 +87,9 @@ class IngestionManager:
                 await self._connect_and_subscribe()
                 self._reconnect.reset()
                 self._staleness_task = asyncio.create_task(self._staleness_monitor())
+                self._bar_consumer_task = asyncio.create_task(self._bar_consumer())
+                self._quote_consumer_task = asyncio.create_task(self._quote_consumer())
+                self._trade_consumer_task = asyncio.create_task(self._trade_consumer())
 
                 while self._running and await self._provider.is_connected():
                     await asyncio.sleep(1.0)
@@ -87,6 +104,9 @@ class IngestionManager:
 
             if self._staleness_task and not self._staleness_task.done():
                 self._staleness_task.cancel()
+            for task in (self._bar_consumer_task, self._quote_consumer_task, self._trade_consumer_task):
+                if task and not task.done():
+                    task.cancel()
 
             if self._running:
                 should_retry = await self._reconnect.wait()
@@ -99,6 +119,9 @@ class IngestionManager:
         self._running = False
         if self._staleness_task and not self._staleness_task.done():
             self._staleness_task.cancel()
+        for task in (self._bar_consumer_task, self._quote_consumer_task, self._trade_consumer_task):
+            if task and not task.done():
+                task.cancel()
         if self._lease_task and not self._lease_task.done():
             self._lease_task.cancel()
         try:
@@ -127,33 +150,114 @@ class IngestionManager:
         logger.info("ingestion_subscribed", symbols=self._symbols)
 
     async def _on_bar(self, event: object) -> None:
+        """Enqueue bar for processing in main loop (thread-safe, fast return)."""
         from trader.core.events import BarEvent
         if isinstance(event, BarEvent):
             try:
-                factory = get_session_factory()
-            except RuntimeError:
-                factory = None
-
-            if factory is None:
-                await self._bar_handler.handle(event)
-            else:
-                async with factory() as session:
-                    await self._bar_handler.handle(event, session=session)
-                    await session.commit()
-            await self._state_store.record_bar_timestamp(event.symbol, event.timestamp)
+                self._bar_queue.put_nowait(event)
+            except queue.Full:
+                logger.warning("bar_queue_full", symbol=event.symbol)
 
     async def _on_quote(self, event: object) -> None:
+        """Enqueue quote for processing in main loop (thread-safe, fast return)."""
         from trader.core.events import QuoteEvent
         if isinstance(event, QuoteEvent):
-            await self._quote_handler.handle(event)
-            if event.bid_price > 0:
-                spread_bps = float(event.spread / event.bid_price * 10000)
-                await self._state_store.record_spread_bps(event.symbol, spread_bps)
+            try:
+                self._quote_queue.put_nowait(event)
+            except queue.Full:
+                pass
 
     async def _on_trade(self, event: object) -> None:
+        """Enqueue trade for processing in main loop (thread-safe, fast return)."""
         from trader.core.events import TradeEvent
         if isinstance(event, TradeEvent):
-            await self._trade_handler.handle(event)
+            try:
+                self._trade_queue.put_nowait(event)
+            except queue.Full:
+                pass
+
+    async def _process_bar(self, event: object) -> None:
+        """Process bar in main event loop (DB, Redis)."""
+        from trader.core.events import BarEvent
+        if not isinstance(event, BarEvent):
+            return
+        try:
+            factory = get_session_factory()
+        except RuntimeError:
+            factory = None
+
+        if factory is None:
+            await self._bar_handler.handle(event)
+        else:
+            async with factory() as session:
+                await self._bar_handler.handle(event, session=session)
+                await session.commit()
+        await self._state_store.record_bar_timestamp(event.symbol, event.timestamp)
+
+    async def _process_quote(self, event: object) -> None:
+        """Process quote in main event loop (Redis)."""
+        from trader.core.events import QuoteEvent
+        if not isinstance(event, QuoteEvent):
+            return
+        await self._quote_handler.handle(event)
+        if event.bid_price > 0:
+            spread_bps = float(event.spread / event.bid_price * 10000)
+            await self._state_store.record_spread_bps(event.symbol, spread_bps)
+
+    async def _process_trade(self, event: object) -> None:
+        """Process trade in main event loop."""
+        from trader.core.events import TradeEvent
+        if not isinstance(event, TradeEvent):
+            return
+        await self._trade_handler.handle(event)
+
+    async def _bar_consumer(self) -> None:
+        """Consume bar queue in main loop."""
+        try:
+            while self._running:
+                try:
+                    event = self._bar_queue.get_nowait()
+                except queue.Empty:
+                    await asyncio.sleep(0.05)
+                    continue
+                try:
+                    await self._process_bar(event)
+                except Exception as e:
+                    logger.error("bar_process_failed", symbol=getattr(event, "symbol", "?"), error=str(e))
+        except asyncio.CancelledError:
+            pass
+
+    async def _quote_consumer(self) -> None:
+        """Consume quote queue in main loop."""
+        try:
+            while self._running:
+                try:
+                    event = self._quote_queue.get_nowait()
+                except queue.Empty:
+                    await asyncio.sleep(0.05)
+                    continue
+                try:
+                    await self._process_quote(event)
+                except Exception as e:
+                    logger.debug("quote_process_failed", error=str(e))
+        except asyncio.CancelledError:
+            pass
+
+    async def _trade_consumer(self) -> None:
+        """Consume trade queue in main loop."""
+        try:
+            while self._running:
+                try:
+                    event = self._trade_queue.get_nowait()
+                except queue.Empty:
+                    await asyncio.sleep(0.05)
+                    continue
+                try:
+                    await self._process_trade(event)
+                except Exception as e:
+                    logger.debug("trade_process_failed", error=str(e))
+        except asyncio.CancelledError:
+            pass
 
     async def _on_error(self, error: Exception) -> None:
         logger.error("ingestion_provider_error", error=str(error))
