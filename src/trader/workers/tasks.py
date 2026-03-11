@@ -13,7 +13,7 @@ from trader.celery_app import celery
 from trader.config import get_settings
 from trader.core.events import BarEvent
 from trader.core.redis_client import init_redis
-from trader.db.session import get_session_factory, init_engine, reset_engine_for_celery
+from trader.db.session import close_engine, get_session_factory, init_engine, reset_engine_for_celery
 from trader.features.engine import FeatureEngine
 from trader.providers.broker.factory import create_broker_provider
 from trader.db.repositories.fills import FillRepository
@@ -148,44 +148,47 @@ def compute_features(symbol: str) -> dict:
     reset_engine_for_celery()
 
     async def _run() -> dict:
-        settings, factory, _ = _bootstrap()
-        await _ensure_redis()
-        async with factory() as session:
-            from trader.db.repositories.market_bars import MarketBarRepository
+        try:
+            settings, factory, _ = _bootstrap()
+            await _ensure_redis()
+            async with factory() as session:
+                from trader.db.repositories.market_bars import MarketBarRepository
 
-            repo = MarketBarRepository(session)
-            state_store = SystemStateStore()
-            bars = await repo.get_recent(symbol, limit=400)
-            engine = FeatureEngine(max_bars=400)
-            for bar in bars:
-                engine.add_bar(
-                    BarEvent(
-                        symbol=bar.symbol,
-                        timestamp=bar.timestamp,
-                        open=bar.open,
-                        high=bar.high,
-                        low=bar.low,
-                        close=bar.close,
-                        volume=bar.volume,
-                        vwap=bar.vwap,
-                        trade_count=bar.trade_count,
-                        interval=bar.interval,
+                repo = MarketBarRepository(session)
+                state_store = SystemStateStore()
+                bars = await repo.get_recent(symbol, limit=400)
+                engine = FeatureEngine(max_bars=400)
+                for bar in bars:
+                    engine.add_bar(
+                        BarEvent(
+                            symbol=bar.symbol,
+                            timestamp=bar.timestamp,
+                            open=bar.open,
+                            high=bar.high,
+                            low=bar.low,
+                            close=bar.close,
+                            volume=bar.volume,
+                            vwap=bar.vwap,
+                            trade_count=bar.trade_count,
+                            interval=bar.interval,
+                        )
                     )
+                spread_bps = await state_store.get_spread_bps(symbol)
+                features = engine.compute_features(
+                    symbol,
+                    bars[-1].timestamp if bars else None,
+                    spread_bps=spread_bps,
                 )
-            spread_bps = await state_store.get_spread_bps(symbol)
-            features = engine.compute_features(
-                symbol,
-                bars[-1].timestamp if bars else None,
-                spread_bps=spread_bps,
-            )
-            logger.info(
-                "features_computed",
-                symbol=symbol,
-                feature_count=len(features),
-                bar_count=len(bars),
-                env=settings.app_env,
-            )
-            return {"symbol": symbol, "features": features, "bar_count": len(bars)}
+                logger.info(
+                    "features_computed",
+                    symbol=symbol,
+                    feature_count=len(features),
+                    bar_count=len(bars),
+                    env=settings.app_env,
+                )
+                return {"symbol": symbol, "features": features, "bar_count": len(bars)}
+        finally:
+            await close_engine()
 
     return asyncio.run(_run())
 
@@ -196,12 +199,15 @@ def run_prediction(symbol: str, features: dict) -> dict:
     reset_engine_for_celery()
 
     async def _run() -> dict:
-        _, factory, _ = _bootstrap()
-        await _ensure_redis()
-        async with factory() as session:
-            pipeline = await _model_loader.load_ensemble(session=session)
-            prediction = pipeline.predict(symbol, features, datetime.now(timezone.utc))
-            return prediction.model_dump(mode="json")
+        try:
+            _, factory, _ = _bootstrap()
+            await _ensure_redis()
+            async with factory() as session:
+                pipeline = await _model_loader.load_ensemble(session=session)
+                prediction = pipeline.predict(symbol, features, datetime.now(timezone.utc))
+                return prediction.model_dump(mode="json")
+        finally:
+            await close_engine()
 
     return asyncio.run(_run())
 
@@ -212,117 +218,118 @@ def manage_open_orders() -> dict:
     reset_engine_for_celery()
 
     async def _run() -> dict:
-        settings, factory, broker = _bootstrap()
-        await _ensure_redis()
-        async with factory() as session:
-            orders = OrderRepository(session)
-            fills = FillRepository(session)
-            trade_intents = TradeIntentRepository(session)
-            lifecycle = OrderLifecycleTracker(session)
-            ledger = PositionLedger(session)
+        try:
+            settings, factory, broker = _bootstrap()
+            await _ensure_redis()
+            async with factory() as session:
+                orders = OrderRepository(session)
+                fills = FillRepository(session)
+                trade_intents = TradeIntentRepository(session)
+                lifecycle = OrderLifecycleTracker(session)
+                ledger = PositionLedger(session)
 
-            async def _sync_snapshot(order, broker_order) -> tuple[int, int]:
-                recorded = 0
-                completed = 0
-                await lifecycle.update_status(
-                    order_id=order.id,
-                    new_status=broker_order.status,
-                    broker_order_id=broker_order.broker_order_id,
-                    filled_qty=broker_order.filled_qty,
-                    filled_avg_price=float(broker_order.filled_avg_price)
-                    if broker_order.filled_avg_price is not None
-                    else None,
-                )
-                order.broker_metadata = getattr(broker_order, "raw", {}) or {}
+                async def _sync_snapshot(order, broker_order) -> tuple[int, int]:
+                    recorded = 0
+                    completed = 0
+                    await lifecycle.update_status(
+                        order_id=order.id,
+                        new_status=broker_order.status,
+                        broker_order_id=broker_order.broker_order_id,
+                        filled_qty=broker_order.filled_qty,
+                        filled_avg_price=float(broker_order.filled_avg_price)
+                        if broker_order.filled_avg_price is not None
+                        else None,
+                    )
+                    order.broker_metadata = getattr(broker_order, "raw", {}) or {}
 
-                if order.trade_intent_id is not None:
-                    if broker_order.status in {"partially_filled", "filled"}:
-                        await trade_intents.update_by_id(order.trade_intent_id, status="executed")
-                    elif broker_order.status in {"rejected", "failed"}:
-                        await trade_intents.update_by_id(order.trade_intent_id, status="rejected")
-                    elif broker_order.status in {"cancelled", "expired"}:
-                        await trade_intents.update_by_id(order.trade_intent_id, status="cancelled")
+                    if order.trade_intent_id is not None:
+                        if broker_order.status in {"partially_filled", "filled"}:
+                            await trade_intents.update_by_id(order.trade_intent_id, status="executed")
+                        elif broker_order.status in {"rejected", "failed"}:
+                            await trade_intents.update_by_id(order.trade_intent_id, status="rejected")
+                        elif broker_order.status in {"cancelled", "expired"}:
+                            await trade_intents.update_by_id(order.trade_intent_id, status="cancelled")
 
-                if (
-                    broker_order.status in {"partially_filled", "filled"}
-                    and broker_order.filled_avg_price is not None
-                    and broker_order.filled_qty > 0
-                ):
-                    existing_fills = await fills.get_by_order_id(order.id)
-                    recorded_qty = _tracked_fill_qty(existing_fills)
-                    recorded_notional = _tracked_fill_notional(existing_fills)
-                    delta_qty = int(broker_order.filled_qty) - recorded_qty
-                    if delta_qty > 0:
-                        delta_fill_price = _incremental_fill_price(
-                            cumulative_qty=int(broker_order.filled_qty),
-                            cumulative_avg_price=broker_order.filled_avg_price,
-                            recorded_qty=recorded_qty,
-                            recorded_notional=recorded_notional,
-                        )
-                        fill_timestamp = _fill_timestamp_from_raw(
-                            getattr(broker_order, "raw", None),
-                            order.filled_at or order.submitted_at or now,
-                        )
-                        await lifecycle.record_fill(
-                            order_id=order.id,
-                            broker_order_id=broker_order.broker_order_id,
-                            symbol=order.symbol,
-                            side=order.side,
-                            qty=delta_qty,
-                            price=float(delta_fill_price),
-                            execution_key=_execution_key(broker_order.broker_order_id, int(broker_order.filled_qty)),
-                            broker_execution_timestamp=fill_timestamp,
-                            timestamp=fill_timestamp,
-                            raw=getattr(broker_order, "raw", None),
-                        )
-                        synthetic_intent = TradeIntentParams(
-                            symbol=order.symbol,
-                            side=order.side,
-                            qty=delta_qty,
-                            entry_order_type=order.order_type,
-                            limit_price=order.limit_price,
-                            strategy_tag=order.strategy_tag,
-                            rationale=order.rationale,
-                        )
-                        await ledger.apply_fill(
-                            order=order,
-                            intent=synthetic_intent,
-                            fill_price=delta_fill_price,
-                            fill_qty=delta_qty,
-                            commission=Decimal("0"),
-                            timestamp=fill_timestamp,
-                        )
-                        recorded += 1
+                    if (
+                        broker_order.status in {"partially_filled", "filled"}
+                        and broker_order.filled_avg_price is not None
+                        and broker_order.filled_qty > 0
+                    ):
+                        existing_fills = await fills.get_by_order_id(order.id)
+                        recorded_qty = _tracked_fill_qty(existing_fills)
+                        recorded_notional = _tracked_fill_notional(existing_fills)
+                        delta_qty = int(broker_order.filled_qty) - recorded_qty
+                        if delta_qty > 0:
+                            delta_fill_price = _incremental_fill_price(
+                                cumulative_qty=int(broker_order.filled_qty),
+                                cumulative_avg_price=broker_order.filled_avg_price,
+                                recorded_qty=recorded_qty,
+                                recorded_notional=recorded_notional,
+                            )
+                            fill_timestamp = _fill_timestamp_from_raw(
+                                getattr(broker_order, "raw", None),
+                                order.filled_at or order.submitted_at or now,
+                            )
+                            await lifecycle.record_fill(
+                                order_id=order.id,
+                                broker_order_id=broker_order.broker_order_id,
+                                symbol=order.symbol,
+                                side=order.side,
+                                qty=delta_qty,
+                                price=float(delta_fill_price),
+                                execution_key=_execution_key(broker_order.broker_order_id, int(broker_order.filled_qty)),
+                                broker_execution_timestamp=fill_timestamp,
+                                timestamp=fill_timestamp,
+                                raw=getattr(broker_order, "raw", None),
+                            )
+                            synthetic_intent = TradeIntentParams(
+                                symbol=order.symbol,
+                                side=order.side,
+                                qty=delta_qty,
+                                entry_order_type=order.order_type,
+                                limit_price=order.limit_price,
+                                strategy_tag=order.strategy_tag,
+                                rationale=order.rationale,
+                            )
+                            await ledger.apply_fill(
+                                order=order,
+                                intent=synthetic_intent,
+                                fill_price=delta_fill_price,
+                                fill_qty=delta_qty,
+                                commission=Decimal("0"),
+                                timestamp=fill_timestamp,
+                            )
+                            recorded += 1
 
-                for leg_snapshot in _embedded_leg_orders(broker_order):
-                    child_order = await orders.get_by_broker_order_id(leg_snapshot.broker_order_id)
-                    if child_order is None:
-                        child_order, _ = await orders.create_idempotent(
-                            idempotency_key=f"broker-child:{leg_snapshot.broker_order_id}",
-                            trade_intent_id=order.trade_intent_id,
-                            broker_order_id=leg_snapshot.broker_order_id,
-                            symbol=leg_snapshot.symbol or order.symbol,
-                            side=leg_snapshot.side or ("sell" if order.side == "buy" else "buy"),
-                            order_type=leg_snapshot.order_type,
-                            order_class="simple",
-                            qty=leg_snapshot.qty,
-                            limit_price=leg_snapshot.limit_price,
-                            stop_price=leg_snapshot.stop_price,
-                            status=leg_snapshot.status,
-                            strategy_tag=order.strategy_tag,
-                            rationale=order.rationale,
-                            broker_metadata={
-                                **getattr(leg_snapshot, "raw", {}),
-                                "parent_order_id": order.broker_order_id,
-                            },
-                        )
-                    child_recorded, child_completed = await _sync_snapshot(child_order, leg_snapshot)
-                    recorded += child_recorded
-                    completed += child_completed
+                    for leg_snapshot in _embedded_leg_orders(broker_order):
+                        child_order = await orders.get_by_broker_order_id(leg_snapshot.broker_order_id)
+                        if child_order is None:
+                            child_order, _ = await orders.create_idempotent(
+                                idempotency_key=f"broker-child:{leg_snapshot.broker_order_id}",
+                                trade_intent_id=order.trade_intent_id,
+                                broker_order_id=leg_snapshot.broker_order_id,
+                                symbol=leg_snapshot.symbol or order.symbol,
+                                side=leg_snapshot.side or ("sell" if order.side == "buy" else "buy"),
+                                order_type=leg_snapshot.order_type,
+                                order_class="simple",
+                                qty=leg_snapshot.qty,
+                                limit_price=leg_snapshot.limit_price,
+                                stop_price=leg_snapshot.stop_price,
+                                status=leg_snapshot.status,
+                                strategy_tag=order.strategy_tag,
+                                rationale=order.rationale,
+                                broker_metadata={
+                                    **getattr(leg_snapshot, "raw", {}),
+                                    "parent_order_id": order.broker_order_id,
+                                },
+                            )
+                        child_recorded, child_completed = await _sync_snapshot(child_order, leg_snapshot)
+                        recorded += child_recorded
+                        completed += child_completed
 
-                if broker_order.status == "filled":
-                    completed += 1
-                return recorded, completed
+                    if broker_order.status == "filled":
+                        completed += 1
+                    return recorded, completed
 
             open_orders = await orders.get_open_orders()
             synced = 0
@@ -382,6 +389,8 @@ def manage_open_orders() -> dict:
             }
             logger.info("open_orders_managed", **result)
             return result
+        finally:
+            await close_engine()
 
     return asyncio.run(_run())
 
@@ -392,19 +401,22 @@ def execute_trading_cycle() -> dict:
     reset_engine_for_celery()
 
     async def _run() -> dict:
-        settings, factory, broker = _bootstrap()
-        await _ensure_redis()
-        async with factory() as session:
-            service = TradingCycleService(
-                settings=settings,
-                session=session,
-                broker=broker,
-                model_loader=_model_loader,
-                state_store=SystemStateStore(),
-            )
-            results = await service.run_cycle()
-            logger.info("trading_cycle_complete", **results)
-            return results
+        try:
+            settings, factory, broker = _bootstrap()
+            await _ensure_redis()
+            async with factory() as session:
+                service = TradingCycleService(
+                    settings=settings,
+                    session=session,
+                    broker=broker,
+                    model_loader=_model_loader,
+                    state_store=SystemStateStore(),
+                )
+                results = await service.run_cycle()
+                logger.info("trading_cycle_complete", **results)
+                return results
+        finally:
+            await close_engine()
 
     return asyncio.run(_run())
 
@@ -415,19 +427,22 @@ def reconcile_positions() -> dict:
     reset_engine_for_celery()
 
     async def _run() -> dict:
-        settings, factory, broker = _bootstrap()
-        await _ensure_redis()
-        async with factory() as session:
-            service = TradingCycleService(
-                settings=settings,
-                session=session,
-                broker=broker,
-                model_loader=_model_loader,
-                state_store=SystemStateStore(),
-            )
-            result = await service.reconcile_positions(auto_fix=False, halt_on_discrepancy=True)
-            logger.info("reconciliation_task_completed", **result)
-            return result
+        try:
+            settings, factory, broker = _bootstrap()
+            await _ensure_redis()
+            async with factory() as session:
+                service = TradingCycleService(
+                    settings=settings,
+                    session=session,
+                    broker=broker,
+                    model_loader=_model_loader,
+                    state_store=SystemStateStore(),
+                )
+                result = await service.reconcile_positions(auto_fix=False, halt_on_discrepancy=True)
+                logger.info("reconciliation_task_completed", **result)
+                return result
+        finally:
+            await close_engine()
 
     return asyncio.run(_run())
 
@@ -438,19 +453,22 @@ def snapshot_pnl() -> dict:
     reset_engine_for_celery()
 
     async def _run() -> dict:
-        settings, factory, broker = _bootstrap()
-        await _ensure_redis()
-        async with factory() as session:
-            service = TradingCycleService(
-                settings=settings,
-                session=session,
-                broker=broker,
-                model_loader=_model_loader,
-                state_store=SystemStateStore(),
-            )
-            snapshot = await service.snapshot_pnl()
-            logger.info("pnl_snapshot_taken", **snapshot)
-            return snapshot
+        try:
+            settings, factory, broker = _bootstrap()
+            await _ensure_redis()
+            async with factory() as session:
+                service = TradingCycleService(
+                    settings=settings,
+                    session=session,
+                    broker=broker,
+                    model_loader=_model_loader,
+                    state_store=SystemStateStore(),
+                )
+                snapshot = await service.snapshot_pnl()
+                logger.info("pnl_snapshot_taken", **snapshot)
+                return snapshot
+        finally:
+            await close_engine()
 
     return asyncio.run(_run())
 
