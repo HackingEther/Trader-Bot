@@ -34,10 +34,6 @@ _model_loader = ChampionModelLoader()
 
 def _bootstrap() -> tuple:
     settings = get_settings()
-    # Celery tasks use asyncio.run() which creates a new event loop per task.
-    # The cached engine's connections are bound to the previous loop. Reset so
-    # we create a fresh engine for this task's loop.
-    reset_engine_for_celery()
     try:
         factory = get_session_factory()
     except RuntimeError:
@@ -149,6 +145,7 @@ def heartbeat_system() -> dict:
 @celery.task(name="trader.workers.tasks.compute_features")
 def compute_features(symbol: str) -> dict:
     """Compute features for a symbol using the most recent persisted bars."""
+    reset_engine_for_celery()
 
     async def _run() -> dict:
         settings, factory, _ = _bootstrap()
@@ -196,6 +193,7 @@ def compute_features(symbol: str) -> dict:
 @celery.task(name="trader.workers.tasks.run_prediction")
 def run_prediction(symbol: str, features: dict) -> dict:
     """Run model ensemble prediction for a symbol."""
+    reset_engine_for_celery()
 
     async def _run() -> dict:
         _, factory, _ = _bootstrap()
@@ -211,6 +209,7 @@ def run_prediction(symbol: str, features: dict) -> dict:
 @celery.task(name="trader.workers.tasks.manage_open_orders")
 def manage_open_orders() -> dict:
     """Synchronize open orders with the broker and cancel stale orders."""
+    reset_engine_for_celery()
 
     async def _run() -> dict:
         settings, factory, broker = _bootstrap()
@@ -390,6 +389,7 @@ def manage_open_orders() -> dict:
 @celery.task(name="trader.workers.tasks.execute_trading_cycle")
 def execute_trading_cycle() -> dict:
     """Run the full periodic trading cycle."""
+    reset_engine_for_celery()
 
     async def _run() -> dict:
         settings, factory, broker = _bootstrap()
@@ -412,6 +412,7 @@ def execute_trading_cycle() -> dict:
 @celery.task(name="trader.workers.tasks.reconcile_positions")
 def reconcile_positions() -> dict:
     """Reconcile broker positions with local state."""
+    reset_engine_for_celery()
 
     async def _run() -> dict:
         settings, factory, broker = _bootstrap()
@@ -434,6 +435,7 @@ def reconcile_positions() -> dict:
 @celery.task(name="trader.workers.tasks.snapshot_pnl")
 def snapshot_pnl() -> dict:
     """Take a P&L snapshot."""
+    reset_engine_for_celery()
 
     async def _run() -> dict:
         settings, factory, broker = _bootstrap()
