@@ -67,3 +67,24 @@ async def close_engine() -> None:
         await _engine.dispose()
     _engine = None
     _session_factory = None
+
+
+def reset_engine_for_celery() -> None:
+    """Clear cached engine so it can be recreated in the current event loop.
+
+    Each Celery task uses asyncio.run() which creates a new event loop. The
+    cached engine's connections are bound to the previous task's loop, causing
+    "Future attached to a different loop" errors. Call this at the start of each
+    task so a fresh engine is created for the current loop.
+    """
+    global _engine, _session_factory
+    if _engine is None:
+        return
+    import asyncio
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_engine.dispose())
+    finally:
+        loop.close()
+    _engine = None
+    _session_factory = None

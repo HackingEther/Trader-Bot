@@ -13,7 +13,7 @@ from trader.celery_app import celery
 from trader.config import get_settings
 from trader.core.events import BarEvent
 from trader.core.redis_client import init_redis
-from trader.db.session import get_session_factory, init_engine
+from trader.db.session import get_session_factory, init_engine, reset_engine_for_celery
 from trader.features.engine import FeatureEngine
 from trader.providers.broker.factory import create_broker_provider
 from trader.db.repositories.fills import FillRepository
@@ -34,6 +34,10 @@ _model_loader = ChampionModelLoader()
 
 def _bootstrap() -> tuple:
     settings = get_settings()
+    # Celery tasks use asyncio.run() which creates a new event loop per task.
+    # The cached engine's connections are bound to the previous loop. Reset so
+    # we create a fresh engine for this task's loop.
+    reset_engine_for_celery()
     try:
         factory = get_session_factory()
     except RuntimeError:
