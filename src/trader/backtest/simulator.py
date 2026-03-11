@@ -49,7 +49,11 @@ class SimulatedPosition:
         self.pnl: float = 0.0
 
     def maybe_exit(self, bar: BarEvent, current_time: datetime) -> Decimal | None:
-        """Return the exit price if the position should be closed on this bar."""
+        """Return the exit price if the position should be closed on this bar.
+
+        Note: Stop/take-profit fills assume exact execution at the trigger price.
+        In reality, gaps and slippage can cause worse fills.
+        """
         if self.stop_loss:
             if self.side == "buy" and bar.low <= self.stop_loss:
                 return self.stop_loss
@@ -108,6 +112,7 @@ class BacktestSimulator:
         commission: CommissionModel | None = None,
         initial_capital: float = 100000.0,
         ensemble: EnsemblePipeline | None = None,
+        spread_bps_override: float | None = 10.0,
     ) -> None:
         self._symbols = symbols
         self._slippage = slippage or SlippageModel()
@@ -145,6 +150,7 @@ class BacktestSimulator:
         )
         self._feature_engine = FeatureEngine()
         self._ensemble = ensemble or EnsemblePipeline.create_default()
+        self._spread_bps_override = spread_bps_override
 
         self._positions: list[SimulatedPosition] = []
         self._closed_trades: list[SimulatedPosition] = []
@@ -167,6 +173,8 @@ class BacktestSimulator:
 
         all_bars = self._normalize_bars(bars_by_symbol)
 
+        # Entry timing: signal on bar N uses bar N's data; fill is at bar N+1's open.
+        # We never fill on the same bar as the decision (avoids same-bar optimism).
         for symbol, bar in all_bars:
             ts = bar.timestamp
             self._latest_prices[symbol] = bar.close
@@ -198,6 +206,9 @@ class BacktestSimulator:
                 exit_price = pos.maybe_exit(bar, ts)
                 if exit_price is None:
                     continue
+                exit_price = self._slippage.apply(
+                    exit_price, "sell" if pos.side == "buy" else "buy", pos.qty
+                )
                 exit_commission = float(self._commission.calculate(pos.qty))
                 pos.close(exit_price=exit_price, exit_time=ts, exit_commission=exit_commission)
                 if pos.side == "buy":
@@ -213,7 +224,9 @@ class BacktestSimulator:
                 continue
 
             has_position = any(p.symbol == symbol for p in self._positions)
-            features = self._feature_engine.compute_features(symbol, ts)
+            features = self._feature_engine.compute_features(
+                symbol, ts, spread_bps=self._spread_bps_override
+            )
             prediction = self._ensemble.predict(symbol, features, ts)
 
             intent = self._strategy.evaluate(
@@ -222,7 +235,9 @@ class BacktestSimulator:
                 account_equity=Decimal(str(self._mark_to_market_equity())),
                 has_open_position=has_position,
                 features=features,
-                current_spread_bps=features.get("spread_bps", 0.0),
+                current_spread_bps=features.get(
+                    "spread_bps", float(self._spread_bps_override or 0.0)
+                ),
             )
 
             if intent:
@@ -232,7 +247,9 @@ class BacktestSimulator:
                     symbol_exposure=Decimal(str(self._symbol_exposure(symbol))),
                     open_position_count=len(self._positions),
                     consecutive_losses=self._consecutive_losses(),
-                    spread_bps=features.get("spread_bps", 0.0),
+                    spread_bps=features.get(
+                        "spread_bps", float(self._spread_bps_override or 0.0)
+                    ),
                     entry_price=bar.close,
                     last_data_time=ts,
                 )
@@ -336,11 +353,15 @@ class BacktestSimulator:
     def _force_close_open_positions(self) -> None:
         for position in list(self._positions):
             exit_price = self._latest_prices.get(position.symbol, position.entry_price)
+            exit_price = self._slippage.apply(
+                exit_price, "sell" if position.side == "buy" else "buy", position.qty
+            )
+            exit_commission = float(self._commission.calculate(position.qty))
             exit_time = self._latest_timestamps.get(position.symbol, position.entry_time)
-            position.close(exit_price=exit_price, exit_time=exit_time, exit_commission=0.0)
+            position.close(exit_price=exit_price, exit_time=exit_time, exit_commission=exit_commission)
             if position.side == "buy":
-                self._cash += float(exit_price) * position.qty
+                self._cash += float(exit_price) * position.qty - exit_commission
             else:
-                self._cash -= float(exit_price) * position.qty
+                self._cash -= float(exit_price) * position.qty + exit_commission
             self._positions.remove(position)
             self._closed_trades.append(position)

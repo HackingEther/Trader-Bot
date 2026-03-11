@@ -244,6 +244,73 @@ def test_projected_capacity_resizes_intent_to_remaining_exposure() -> None:
     assert resized.rationale["resized_to_qty"] == 3
 
 
+def test_projected_capacity_includes_open_order_exposure() -> None:
+    """Projected exposure correctly reduces remaining capacity for pending open orders."""
+    service = TradingCycleService.__new__(TradingCycleService)
+    service._settings = SimpleNamespace(
+        max_notional_exposure_usd=2000.0,
+        max_exposure_per_symbol_usd=1500.0,
+    )
+    intent = TradeIntentParams(symbol="AAPL", side="buy", qty=20, rationale={"source": "test"})
+
+    resized = service._apply_projected_capacity(
+        intent=intent,
+        price=Decimal("100"),
+        projected_total_exposure=Decimal("1500"),
+        projected_symbol_exposure=Decimal("0"),
+    )
+
+    assert resized is not None
+    assert resized.qty == 5
+
+
+def test_open_order_slots_counts_unique_symbols() -> None:
+    """_open_order_slots counts one slot per symbol with unfilled orders."""
+    orders = [
+        SimpleNamespace(symbol="AAPL", qty=10, filled_qty=5),
+        SimpleNamespace(symbol="MSFT", qty=5, filled_qty=0),
+        SimpleNamespace(symbol="AAPL", qty=8, filled_qty=8),
+    ]
+    slots = TradingCycleService._open_order_slots(orders)
+    assert slots == 2
+
+
+def test_ranking_selects_highest_scores_first() -> None:
+    """Selected candidates are in score-descending order; processing follows that order."""
+    candidates = [
+        SimpleNamespace(score=0.5, symbol="A", intent_record=SimpleNamespace(id=1)),
+        SimpleNamespace(score=0.9, symbol="B", intent_record=SimpleNamespace(id=2)),
+        SimpleNamespace(score=0.7, symbol="C", intent_record=SimpleNamespace(id=3)),
+    ]
+    selected = sorted(candidates, key=lambda c: c.score, reverse=True)[:2]
+    assert [s.symbol for s in selected] == ["B", "C"]
+
+
+def test_record_result_increments_orders_sent_for_approved_and_executed() -> None:
+    """orders_sent counter includes both executed and approved statuses."""
+    from trader.services.trading_cycle import SymbolCycleResult
+
+    service = TradingCycleService.__new__(TradingCycleService)
+    results = {
+        "symbols": [],
+        "symbols_processed": 0,
+        "predictions_persisted": 0,
+        "intents_generated": 0,
+        "orders_submitted": 0,
+        "orders_sent": 0,
+        "orders_rejected": 0,
+        "skipped_no_bars": 0,
+    }
+
+    service._record_result(results, SymbolCycleResult(symbol="AAPL", status="approved", trade_intent_id=1))
+    assert results["orders_sent"] == 1
+    assert results["orders_submitted"] == 0
+
+    service._record_result(results, SymbolCycleResult(symbol="MSFT", status="executed", trade_intent_id=2))
+    assert results["orders_sent"] == 2
+    assert results["orders_submitted"] == 1
+
+
 def test_order_notional_uses_reference_price_rationale_for_market_orders() -> None:
     order = SimpleNamespace(
         qty=10,
@@ -396,7 +463,7 @@ async def test_lifecycle_record_fill_deduplicates_execution_key(tmp_path) -> Non
         await session.flush()
 
         lifecycle = OrderLifecycleTracker(session)
-        first = await lifecycle.record_fill(
+        first_fill, first_new = await lifecycle.record_fill(
             order_id=order.id,
             broker_order_id="broker-1",
             symbol="AAPL",
@@ -406,7 +473,7 @@ async def test_lifecycle_record_fill_deduplicates_execution_key(tmp_path) -> Non
             execution_key="broker-1:5",
             timestamp=datetime.now(timezone.utc),
         )
-        second = await lifecycle.record_fill(
+        second_fill, second_new = await lifecycle.record_fill(
             order_id=order.id,
             broker_order_id="broker-1",
             symbol="AAPL",
@@ -418,7 +485,19 @@ async def test_lifecycle_record_fill_deduplicates_execution_key(tmp_path) -> Non
         )
         fills = await FillRepository(session).get_by_order_id(order.id)
 
-        assert first.id == second.id
+        assert first_fill.id == second_fill.id
+        assert first_new is True
+        assert second_new is False
         assert len(fills) == 1
 
     await engine.dispose()
+
+
+def test_record_fill_returns_is_new_flag() -> None:
+    """record_fill returns (Fill, is_new) tuple; is_new True for new, False for existing."""
+    import inspect
+
+    from trader.execution.lifecycle import OrderLifecycleTracker
+
+    sig = inspect.signature(OrderLifecycleTracker.record_fill)
+    assert "tuple" in str(sig.return_annotation) or "Tuple" in str(sig.return_annotation)

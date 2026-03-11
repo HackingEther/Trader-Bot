@@ -214,3 +214,29 @@ async def test_opens_and_reduces_short_position(session: AsyncSession) -> None:
     assert position.side == "sell"
     assert position.qty == 5
     assert position.realized_pnl == Decimal("30")
+
+
+@pytest.mark.asyncio
+async def test_position_ledger_zero_fill_qty(session: AsyncSession) -> None:
+    """Zero fill_qty in close path returns existing without division-by-zero."""
+    ledger = PositionLedger(session)
+    open_order = await _order(session, side="buy", qty=10, broker_order_id="open")
+    close_order = await _order(session, side="sell", qty=0, broker_order_id="close")
+
+    await ledger.apply_fill(
+        order=open_order,
+        intent=_intent("buy", 10),
+        fill_price=Decimal("100"),
+        fill_qty=10,
+        timestamp=datetime.now(timezone.utc),
+    )
+    position = await ledger.apply_fill(
+        order=close_order,
+        intent=_intent("sell", 0),
+        fill_price=Decimal("105"),
+        fill_qty=0,
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    assert position.qty == 10
+    assert position.status == "open"

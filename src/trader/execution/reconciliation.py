@@ -14,6 +14,19 @@ from trader.providers.broker.base import BrokerProvider
 
 logger = structlog.get_logger(__name__)
 
+_PRICE_TOLERANCE_BPS = Decimal("1")  # 1 basis point = 0.01%
+
+
+def _prices_match(a: Decimal, b: Decimal | None) -> bool:
+    """Compare two prices with tolerance for floating-point and broker rounding."""
+    if b is None:
+        return True
+    if a == b:
+        return True
+    diff = abs(a - b)
+    tolerance = max(Decimal("1e-6"), abs(a) * _PRICE_TOLERANCE_BPS / Decimal("10000"))
+    return diff <= tolerance
+
 
 class ReconciliationResult:
     """Result of a reconciliation check."""
@@ -59,8 +72,15 @@ class PositionReconciler:
             lp = local_map.get(symbol)
 
             if bp and lp:
-                avg_entry_matches = bp.avg_entry_price == lp.avg_entry_price
-                current_price_matches = bp.current_price == lp.current_price or lp.current_price is None
+                avg_entry_matches = _prices_match(bp.avg_entry_price, lp.avg_entry_price)
+                current_price_matches = (
+                    lp.current_price is None
+                    or (
+                        bp.current_price is not None
+                        and lp.current_price is not None
+                        and _prices_match(bp.current_price, lp.current_price)
+                    )
+                )
                 if bp.qty == lp.qty and bp.side == lp.side and avg_entry_matches and current_price_matches:
                     result.matched.append(symbol)
                     if auto_fix and bp.current_price:

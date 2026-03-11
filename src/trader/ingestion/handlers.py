@@ -8,6 +8,7 @@ from collections.abc import Hashable
 
 import structlog
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from trader.core.events import BarEvent, QuoteEvent, TradeEvent
@@ -113,15 +114,23 @@ class BarHandler(_DeduplicatingHandler):
                 )
                 await session.execute(statement)
             else:
-                existing = await session.scalar(
-                    select(MarketBar.id).where(
-                        MarketBar.symbol == event.symbol,
-                        MarketBar.interval == event.interval,
-                        MarketBar.timestamp == event.timestamp,
+                try:
+                    existing = await session.scalar(
+                        select(MarketBar.id).where(
+                            MarketBar.symbol == event.symbol,
+                            MarketBar.interval == event.interval,
+                            MarketBar.timestamp == event.timestamp,
+                        )
                     )
-                )
-                if existing is None:
-                    session.add(MarketBar(**values))
+                    if existing is None:
+                        session.add(MarketBar(**values))
+                        await session.flush()
+                except IntegrityError:
+                    logger.debug(
+                        "duplicate_bar_ignored_race",
+                        symbol=event.symbol,
+                        timestamp=event.timestamp.isoformat(),
+                    )
 
         if self._count % 100 == 0:
             logger.debug("bar_handler_progress", count=self._count, latest_symbol=event.symbol)

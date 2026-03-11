@@ -265,3 +265,185 @@ def test_manage_open_orders_cancels_stale_records_fill_delta_and_isolates_errors
             assert tsla_position is None
 
     asyncio.run(_assert_db_state())
+
+
+async def _seed_orders_for_partial_progression(factory: async_sessionmaker[AsyncSession]) -> None:
+    """Seed a single order with 0 fills for testing multi-step partial fill progression."""
+    now = datetime.now(timezone.utc)
+    async with factory() as session:
+        session.add(
+            Order(
+                idempotency_key="prog-key",
+                broker_order_id="prog-order",
+                symbol="MSFT",
+                side="buy",
+                order_type="limit",
+                order_class="simple",
+                time_in_force="day",
+                qty=10,
+                filled_qty=0,
+                status="accepted",
+                strategy_tag="test",
+                rationale={},
+                broker_metadata={},
+                created_at=now,
+                updated_at=now,
+                submitted_at=now,
+            )
+        )
+        await session.commit()
+
+
+def test_manage_open_orders_partial_fill_progression_records_delta_correctly(
+    monkeypatch: pytest.MonkeyPatch,
+    db_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Partial fills 0->2->5 are recorded as incremental deltas; position stays correct."""
+    asyncio.run(_seed_orders_for_partial_progression(db_factory))
+
+    orders_dict = {
+        "prog-order": _BrokerOrder(
+            broker_order_id="prog-order",
+            status="partially_filled",
+            filled_qty=2,
+            filled_avg_price=Decimal("100"),
+        ),
+    }
+    broker = _FakeBroker(orders=orders_dict)
+
+    async def _noop() -> None:
+        return None
+
+    monkeypatch.setattr(
+        tasks,
+        "_bootstrap",
+        lambda: (SimpleNamespace(open_order_stale_seconds=9000), db_factory, broker),
+    )
+    monkeypatch.setattr(tasks, "_ensure_redis", _noop)
+
+    result1 = tasks.manage_open_orders()
+    assert result1["fills_recorded"] == 1
+
+    async def _assert_after_first() -> None:
+        async with db_factory() as session:
+            order = await OrderRepository(session).get_by_broker_order_id("prog-order")
+            fills = await FillRepository(session).get_by_order_id(order.id)
+            pos = await PositionRepository(session).get_open_by_symbol("MSFT")
+            assert sum(f.qty for f in fills) == 2
+            assert pos is not None and pos.qty == 2
+
+    asyncio.run(_assert_after_first())
+
+    orders_dict["prog-order"] = _BrokerOrder(
+        broker_order_id="prog-order",
+        status="partially_filled",
+        filled_qty=5,
+        filled_avg_price=Decimal("101"),
+    )
+
+    result2 = tasks.manage_open_orders()
+    assert result2["fills_recorded"] == 1
+
+    async def _assert_after_second() -> None:
+        async with db_factory() as session:
+            order = await OrderRepository(session).get_by_broker_order_id("prog-order")
+            fills = await FillRepository(session).get_by_order_id(order.id)
+            pos = await PositionRepository(session).get_open_by_symbol("MSFT")
+            assert sum(f.qty for f in fills) == 5
+            assert len(fills) == 2
+            assert pos is not None and pos.qty == 5
+
+    asyncio.run(_assert_after_second())
+
+
+def test_manage_open_orders_stale_aging_uses_submitted_at_and_cancels_when_exceeded(
+    monkeypatch: pytest.MonkeyPatch,
+    db_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Stale order age is computed from submitted_at (or created_at); orders older than threshold are cancelled."""
+    asyncio.run(_seed_orders(db_factory))
+    broker = _FakeBroker(
+        orders={
+            "stale-order": _BrokerOrder(broker_order_id="stale-order", status="accepted"),
+            "partial-order": _BrokerOrder(
+                broker_order_id="partial-order",
+                status="partially_filled",
+                filled_qty=5,
+                filled_avg_price=Decimal("101"),
+            ),
+            "bracket-parent": _BrokerOrder(
+                broker_order_id="bracket-parent",
+                status="filled",
+                filled_qty=3,
+                filled_avg_price=Decimal("200"),
+                raw={"filled_at": datetime.now(timezone.utc).isoformat(), "legs": []},
+            ),
+        },
+        failing_ids={"error-order"},
+    )
+
+    async def _noop() -> None:
+        return None
+
+    monkeypatch.setattr(
+        tasks,
+        "_bootstrap",
+        lambda: (SimpleNamespace(open_order_stale_seconds=90), db_factory, broker),
+    )
+    monkeypatch.setattr(tasks, "_ensure_redis", _noop)
+
+    tasks.manage_open_orders()
+
+    assert "stale-order" in broker.cancelled_ids
+    assert "partial-order" not in broker.cancelled_ids
+
+
+def test_manage_open_orders_recent_order_not_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+    db_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Order with recent submitted_at is not cancelled even when status is accepted."""
+
+    async def _seed_recent() -> None:
+        now = datetime.now(timezone.utc)
+        async with db_factory() as session:
+            session.add(
+                Order(
+                    idempotency_key="recent-key",
+                    broker_order_id="recent-order",
+                    symbol="AAPL",
+                    side="buy",
+                    order_type="limit",
+                    order_class="simple",
+                    time_in_force="day",
+                    qty=5,
+                    status="accepted",
+                    strategy_tag="test",
+                    rationale={},
+                    broker_metadata={},
+                    created_at=now,
+                    updated_at=now,
+                    submitted_at=now,
+                )
+            )
+            await session.commit()
+
+    asyncio.run(_seed_recent())
+
+    broker = _FakeBroker(
+        orders={"recent-order": _BrokerOrder(broker_order_id="recent-order", status="accepted")},
+    )
+
+    async def _noop() -> None:
+        return None
+
+    monkeypatch.setattr(
+        tasks,
+        "_bootstrap",
+        lambda: (SimpleNamespace(open_order_stale_seconds=90), db_factory, broker),
+    )
+    monkeypatch.setattr(tasks, "_ensure_redis", _noop)
+
+    tasks.manage_open_orders()
+
+    assert "recent-order" not in broker.cancelled_ids

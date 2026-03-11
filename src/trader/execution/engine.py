@@ -113,7 +113,7 @@ class ExecutionEngine:
 
             if broker_order.status == OrderStatus.FILLED and broker_order.filled_avg_price:
                 fill_timestamp = self._fill_timestamp_from_raw(broker_order.raw) or order.filled_at or datetime.now(timezone.utc)
-                await self._lifecycle.record_fill(
+                _, is_new = await self._lifecycle.record_fill(
                     order_id=order.id,
                     broker_order_id=broker_order.broker_order_id,
                     symbol=intent.symbol,
@@ -125,13 +125,14 @@ class ExecutionEngine:
                     timestamp=fill_timestamp,
                     raw=broker_order.raw,
                 )
-                await self._positions.apply_fill(
-                    order=order,
-                    intent=intent,
-                    fill_price=broker_order.filled_avg_price,
-                    fill_qty=broker_order.filled_qty,
-                    timestamp=fill_timestamp,
-                )
+                if is_new:
+                    await self._positions.apply_fill(
+                        order=order,
+                        intent=intent,
+                        fill_price=broker_order.filled_avg_price,
+                        fill_qty=broker_order.filled_qty,
+                        timestamp=fill_timestamp,
+                    )
 
             logger.info(
                 "order_executed",

@@ -153,7 +153,8 @@ def test_backtest_short_cash_flow_matches_realized_pnl() -> None:
     assert simulator._cash == pytest.approx(results["final_equity"], abs=1e-6)
 
 
-def test_backtest_enters_on_next_bar_open_not_signal_bar() -> None:
+def test_backtest_no_same_bar_fill_entry_always_next_bar() -> None:
+    """Entry fill is always at next bar's open; never same bar as signal (no same-bar optimism)."""
     bars = _bars(100.0, [0.2] * 16 + [5.0, 0.0])
     simulator = BacktestSimulator(
         symbols=["AAPL"],
@@ -181,6 +182,8 @@ def test_backtest_enters_on_next_bar_open_not_signal_bar() -> None:
     closed_trade = simulator._closed_trades[0]
     assert closed_trade.entry_price == bars[16]["open"]
     assert closed_trade.entry_price != bars[15]["close"]
+    assert closed_trade.entry_time == bars[16]["timestamp"]
+    assert closed_trade.entry_time != bars[15]["timestamp"]
 
 
 def test_backtest_force_closes_open_position_at_last_bar() -> None:
@@ -212,3 +215,101 @@ def test_backtest_force_closes_open_position_at_last_bar() -> None:
     assert simulator._positions == []
     assert simulator._closed_trades[0].exit_time == bars[-1]["timestamp"]
     assert results["final_equity"] == pytest.approx(1000.0 + results["total_pnl"], abs=1e-6)
+
+
+def test_backtest_exit_slippage_applied() -> None:
+    """Exit price includes slippage (sell gets worse price for long)."""
+    bars = _bars(100.0, [0.2] * 16 + [0.1, 0.0])
+    slippage = SlippageModel(fixed_bps=10.0)
+    simulator = BacktestSimulator(
+        symbols=["AAPL"],
+        strategy_config={
+            "min_history_bars": 16,
+            "min_confidence": 0.0,
+            "min_expected_move_bps": 0.0,
+            "min_relative_volume": 0.0,
+            "max_position_value": 101.0,
+            "risk_per_trade_pct": 1.0,
+        },
+        slippage=slippage,
+        commission=CommissionModel(),
+        initial_capital=1000.0,
+        ensemble=_SequencedEnsemble(
+            [
+                _prediction("long", "trending_up"),
+                _prediction("no_trade", "low_volatility"),
+            ]
+        ),
+    )
+
+    simulator.run({"AAPL": bars})
+
+    closed = simulator._closed_trades[0]
+    raw_exit = bars[-1]["close"]
+    expected_slippage = float(raw_exit) * 0.001
+    assert closed.exit_price < raw_exit
+    assert abs(float(closed.exit_price) - (float(raw_exit) - expected_slippage)) < 0.01
+
+
+def test_backtest_force_close_uses_commission() -> None:
+    """Force-close applies commission to PnL."""
+    bars = _bars(100.0, [0.2] * 18)
+    commission = CommissionModel(per_share=0.01)
+    simulator = BacktestSimulator(
+        symbols=["AAPL"],
+        strategy_config={
+            "min_history_bars": 16,
+            "min_confidence": 0.0,
+            "min_expected_move_bps": 0.0,
+            "min_relative_volume": 0.0,
+            "max_position_value": 101.0,
+            "risk_per_trade_pct": 1.0,
+        },
+        slippage=SlippageModel(fixed_bps=0.0),
+        commission=commission,
+        initial_capital=1000.0,
+        ensemble=_SequencedEnsemble(
+            [
+                _prediction("long", "trending_up"),
+                _prediction("no_trade", "low_volatility"),
+            ]
+        ),
+    )
+
+    results = simulator.run({"AAPL": bars})
+
+    assert results["total_trades"] == 1
+    closed = simulator._closed_trades[0]
+    assert closed.exit_commission > 0
+
+
+def test_backtest_spread_bps_passed_to_strategy_and_risk() -> None:
+    """Backtest passes spread_bps to strategy and risk; high spread can reject trades."""
+    bars = _bars(100.0, [0.2] * 20)
+    simulator = BacktestSimulator(
+        symbols=["AAPL"],
+        strategy_config={
+            "min_history_bars": 16,
+            "min_confidence": 0.0,
+            "min_expected_move_bps": 0.0,
+            "min_relative_volume": 0.0,
+            "max_position_value": 101.0,
+            "risk_per_trade_pct": 1.0,
+            "max_spread_bps": 20.0,
+        },
+        risk_config={"max_spread_bps": 20.0},
+        slippage=SlippageModel(fixed_bps=0.0),
+        commission=CommissionModel(),
+        initial_capital=1000.0,
+        spread_bps_override=50.0,
+        ensemble=_SequencedEnsemble(
+            [
+                _prediction("long", "trending_up"),
+                _prediction("no_trade", "low_volatility"),
+            ]
+        ),
+    )
+
+    results = simulator.run({"AAPL": bars})
+
+    assert results["total_trades"] == 0

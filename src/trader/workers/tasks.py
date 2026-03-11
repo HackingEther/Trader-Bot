@@ -270,7 +270,7 @@ def manage_open_orders() -> dict:
                                 getattr(broker_order, "raw", None),
                                 order.filled_at or order.submitted_at or now,
                             )
-                            await lifecycle.record_fill(
+                            _, is_new = await lifecycle.record_fill(
                                 order_id=order.id,
                                 broker_order_id=broker_order.broker_order_id,
                                 symbol=order.symbol,
@@ -282,24 +282,25 @@ def manage_open_orders() -> dict:
                                 timestamp=fill_timestamp,
                                 raw=getattr(broker_order, "raw", None),
                             )
-                            synthetic_intent = TradeIntentParams(
-                                symbol=order.symbol,
-                                side=order.side,
-                                qty=delta_qty,
-                                entry_order_type=order.order_type,
-                                limit_price=order.limit_price,
-                                strategy_tag=order.strategy_tag,
-                                rationale=order.rationale,
-                            )
-                            await ledger.apply_fill(
-                                order=order,
-                                intent=synthetic_intent,
-                                fill_price=delta_fill_price,
-                                fill_qty=delta_qty,
-                                commission=Decimal("0"),
-                                timestamp=fill_timestamp,
-                            )
-                            recorded += 1
+                            if is_new:
+                                synthetic_intent = TradeIntentParams(
+                                    symbol=order.symbol,
+                                    side=order.side,
+                                    qty=delta_qty,
+                                    entry_order_type=order.order_type,
+                                    limit_price=order.limit_price,
+                                    strategy_tag=order.strategy_tag,
+                                    rationale=order.rationale,
+                                )
+                                await ledger.apply_fill(
+                                    order=order,
+                                    intent=synthetic_intent,
+                                    fill_price=delta_fill_price,
+                                    fill_qty=delta_qty,
+                                    commission=Decimal("0"),
+                                    timestamp=fill_timestamp,
+                                )
+                                recorded += 1
 
                     for leg_snapshot in _embedded_leg_orders(broker_order):
                         child_order = await orders.get_by_broker_order_id(leg_snapshot.broker_order_id)

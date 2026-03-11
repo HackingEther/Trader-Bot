@@ -93,6 +93,7 @@ class TradingCycleService:
             "predictions_persisted": 0,
             "intents_generated": 0,
             "orders_submitted": 0,
+            "orders_sent": 0,
             "orders_rejected": 0,
             "skipped_no_bars": 0,
             "kill_switch_active": False,
@@ -160,8 +161,8 @@ class TradingCycleService:
                         trade_intent_id=candidate.intent_record.id,
                     ),
                 )
-                continue
 
+        for candidate in selected:
             try:
                 resized_intent = self._apply_projected_capacity(
                     intent=candidate.intent,
@@ -581,6 +582,8 @@ class TradingCycleService:
             results["intents_generated"] += 1
         if outcome.status == "executed":
             results["orders_submitted"] += 1
+        if outcome.status in {"executed", "approved"}:
+            results["orders_sent"] += 1
         if outcome.status == "rejected":
             results["orders_rejected"] += 1
 

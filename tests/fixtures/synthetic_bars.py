@@ -58,6 +58,52 @@ def generate_synthetic_bars(
     return bars
 
 
+def generate_trending_up_bars(
+    symbol: str = "AAPL",
+    count: int = 100,
+    start_price: float = 150.0,
+    drift: float = 0.0003,
+    start_time: datetime | None = None,
+    seed: int = 42,
+) -> list[dict]:
+    """Generate bars with guaranteed upward momentum for vwap_continuation playbook.
+
+    Ensures momentum_5m > 0, momentum_15m > 0, distance_from_vwap >= 0,
+    and relative_volume >= 0.9 so strategy selects vwap_continuation.
+    """
+    rng = random.Random(seed)
+    if start_time is None:
+        today = datetime.now(timezone.utc).date()
+        start_time = datetime(today.year, today.month, today.day, 14, 30, tzinfo=timezone.utc)
+
+    bars: list[dict] = []
+    price = float(start_price)
+
+    for i in range(count):
+        noise = rng.gauss(0, 0.00005)
+        close = round(price * (1 + drift + noise), 4)
+        high = round(max(price, close) * (1 + abs(rng.gauss(0, 0.0001))), 4)
+        low = round(min(price, close) * (1 - abs(rng.gauss(0, 0.0001))), 4)
+        volume = 50000
+
+        bar = {
+            "symbol": symbol,
+            "timestamp": start_time + timedelta(minutes=i),
+            "interval": "1m",
+            "open": Decimal(str(price)),
+            "high": Decimal(str(high)),
+            "low": Decimal(str(low)),
+            "close": Decimal(str(close)),
+            "volume": volume,
+            "vwap": Decimal(str(round((high + low + close) / 3, 4))),
+            "trade_count": max(10, int(rng.gauss(500, 100))),
+        }
+        bars.append(bar)
+        price = close
+
+    return bars
+
+
 def generate_multi_symbol_bars(
     symbols: list[str] | None = None,
     count: int = 100,

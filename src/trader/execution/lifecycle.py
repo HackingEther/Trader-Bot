@@ -119,13 +119,13 @@ class OrderLifecycleTracker:
         execution_key: str | None = None,
         broker_execution_timestamp: datetime | None = None,
         raw: dict | None = None,
-    ) -> Fill:
-        """Record a fill event for an order."""
+    ) -> tuple[Fill, bool]:
+        """Record a fill event for an order. Returns (fill, is_new)."""
         from decimal import Decimal
         if execution_key is not None:
             existing = await self._fills.get_by_execution_key(execution_key)
             if existing is not None:
-                return existing
+                return existing, False
         fill = Fill(
             order_id=order_id,
             execution_key=execution_key,
@@ -148,4 +148,4 @@ class OrderLifecycleTracker:
             qty=qty,
             price=price,
         )
-        return fill
+        return fill, True

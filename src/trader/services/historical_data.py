@@ -8,6 +8,7 @@ from decimal import Decimal
 
 import httpx
 import structlog
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from trader.config import get_settings
@@ -74,6 +75,9 @@ class HistoricalDataService:
             end=end.astimezone(UTC),
             interval=interval,
         )
+        dialect_name = self._session.get_bind().dialect.name
+        use_on_conflict = dialect_name in ("postgresql", "sqlite")
+
         async with httpx.AsyncClient(base_url="https://data.alpaca.markets", timeout=30.0) as client:
             next_page_token: str | None = None
             while True:
@@ -84,6 +88,7 @@ class HistoricalDataService:
                 response.raise_for_status()
                 payload = response.json()
 
+                batch_values: list[dict] = []
                 for symbol, bars in payload.get("bars", {}).items():
                     for raw_bar in bars:
                         timestamp = datetime.fromisoformat(raw_bar["t"].replace("Z", "+00:00"))
@@ -91,21 +96,39 @@ class HistoricalDataService:
                         if key in existing:
                             continue
                         existing.add(key)
-                        self._session.add(
-                            MarketBar(
-                                symbol=symbol,
-                                timestamp=timestamp,
-                                interval=interval,
-                                open=Decimal(str(raw_bar["o"])),
-                                high=Decimal(str(raw_bar["h"])),
-                                low=Decimal(str(raw_bar["l"])),
-                                close=Decimal(str(raw_bar["c"])),
-                                volume=int(raw_bar["v"]),
-                                vwap=Decimal(str(raw_bar["vw"])) if raw_bar.get("vw") is not None else None,
-                                trade_count=int(raw_bar["n"]) if raw_bar.get("n") is not None else None,
-                            )
+                        batch_values.append({
+                            "symbol": symbol,
+                            "timestamp": timestamp,
+                            "interval": interval,
+                            "open": Decimal(str(raw_bar["o"])),
+                            "high": Decimal(str(raw_bar["h"])),
+                            "low": Decimal(str(raw_bar["l"])),
+                            "close": Decimal(str(raw_bar["c"])),
+                            "volume": int(raw_bar["v"]),
+                            "vwap": Decimal(str(raw_bar["vw"])) if raw_bar.get("vw") is not None else None,
+                            "trade_count": int(raw_bar["n"]) if raw_bar.get("n") is not None else None,
+                        })
+
+                if batch_values:
+                    if use_on_conflict:
+                        if dialect_name == "postgresql":
+                            from sqlalchemy.dialects.postgresql import insert as dialect_insert
+                        else:
+                            from sqlalchemy.dialects.sqlite import insert as dialect_insert
+                        stmt = dialect_insert(MarketBar).values(batch_values).on_conflict_do_nothing(
+                            index_elements=["symbol", "interval", "timestamp"]
                         )
-                        inserted += 1
+                        await self._session.execute(stmt)
+                        inserted += len(batch_values)
+                    else:
+                        for values in batch_values:
+                            try:
+                                async with self._session.begin_nested():
+                                    self._session.add(MarketBar(**values))
+                                    await self._session.flush()
+                                inserted += 1
+                            except IntegrityError:
+                                pass
 
                 await self._session.flush()
                 next_page_token = payload.get("next_page_token")

@@ -68,6 +68,9 @@ class PositionLedger:
             await self._session.flush()
             return existing
 
+        if fill_qty <= 0:
+            return existing
+
         close_qty = min(existing.qty, fill_qty)
         remaining_qty = existing.qty - close_qty
         close_commission = commission * Decimal(close_qty) / Decimal(fill_qty)
