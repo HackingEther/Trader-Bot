@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+import json
 from typing import Annotated
 
 from pydantic import Field, field_validator
@@ -104,6 +105,14 @@ class Settings(BaseSettings):
     @classmethod
     def parse_symbol_universe(cls, v: object) -> list[str]:
         if isinstance(v, str):
+            stripped = v.strip()
+            if stripped.startswith("["):
+                try:
+                    parsed = json.loads(stripped)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, list):
+                    return [str(symbol).strip() for symbol in parsed if str(symbol).strip()]
             return [s.strip() for s in v.split(",") if s.strip()]
         if isinstance(v, list):
             return v

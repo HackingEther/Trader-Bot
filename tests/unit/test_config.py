@@ -14,3 +14,12 @@ def test_symbol_universe_accepts_comma_separated_env_value(
     settings = Settings()
 
     assert settings.symbol_universe == ["AAPL", "MSFT", "SPY"]
+
+
+def test_symbol_universe_accepts_json_list_env_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMBOL_UNIVERSE", '["AAPL", "MSFT", "SPY"]')
+    settings = Settings()
+
+    assert settings.symbol_universe == ["AAPL", "MSFT", "SPY"]
