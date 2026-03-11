@@ -202,7 +202,10 @@ class IngestionManager:
         await self._quote_handler.handle(event)
         if event.bid_price > 0:
             spread_bps = float(event.spread / event.bid_price * 10000)
-            await self._state_store.record_spread_bps(event.symbol, spread_bps)
+            # IEX can return stale/mismatched bid-ask; reject obviously bad quotes
+            # so they don't overwrite good data (e.g. 1000+ bps blocks all trading)
+            if spread_bps <= 150.0:
+                await self._state_store.record_spread_bps(event.symbol, spread_bps)
 
     async def _process_trade(self, event: object) -> None:
         """Process trade in main event loop."""

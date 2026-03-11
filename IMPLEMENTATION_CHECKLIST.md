@@ -37,6 +37,34 @@
   "
   ```
 
+## Recommended workflow (to get trades)
+
+1. **Backfill historical bars** (before first live day or for training):
+   ```bash
+   docker compose exec app python scripts/backfill_alpaca_bars.py \
+     --symbols "AAPL,MSFT,GOOGL,AMZN,META,NVDA,TSLA,SPY,QQQ,AMD" \
+     --start "2026-03-01T00:00:00Z" \
+     --end "2026-03-11T00:00:00Z" \
+     --feed iex
+   ```
+
+2. **Train champion models** (so the ensemble stops predicting `no_trade` for everything):
+   ```bash
+   docker compose exec app python scripts/train_models_from_history.py \
+     --symbols "AAPL,MSFT,GOOGL,AMZN,NVDA,SPY,QQQ" \
+     --start "2026-03-01T00:00:00Z" \
+     --end "2026-03-10T00:00:00Z" \
+     --lookahead-bars 15
+   ```
+
+3. **Clear bad spread data** (if Redis has 1000+ bps from IEX glitches):
+   ```bash
+   docker compose exec redis redis-cli KEYS "trader:market:last_spread_bps:*" | xargs -I {} docker compose exec redis redis-cli DEL {}
+   ```
+   Or: `docker compose restart app` (spreads repopulate from good quotes during RTH).
+
+4. **Run during regular hours** (9:30–16:00 ET) – live ingestion + trading cycle need market hours for good quotes and volume.
+
 ## Optional / Future
 
 - [ ] **Train champion models** – Default sklearn models are used if no champions. Run training pipeline to train and register champions for better signals.
@@ -45,6 +73,8 @@
 - [ ] **Sentry** – Error tracking.
 - [ ] **Run worker as non-root** – `--uid` in Celery worker config.
 
-## Current Fix (this commit)
+## Fixes in this codebase
 
-- **Event loop / Redis lock** – Bar/quote/trade callbacks from Alpaca’s websocket thread now enqueue events to thread-safe queues; consumer tasks in the main loop process them and persist to DB/Redis. This fixes the “Lock bound to different event loop” error.
+- **Event loop / Redis lock** – Bar/quote/trade callbacks from Alpaca websocket thread now enqueue events to thread-safe queues; consumer tasks in the main loop process them and persist to DB/Redis. Fixes the Lock bound to different event loop error.
+- **Spread cap** – IEX can return stale/mismatched bid-ask (1000+ bps). We now only store spread when ≤150 bps, so bad quotes don't overwrite good data and block trading.
+
