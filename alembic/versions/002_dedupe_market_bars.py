@@ -1,6 +1,6 @@
 """Deduplicate market bars and enforce unique bar identity.
 
-Revision ID: 002
+Revision ID: 002_dedupe_market_bars
 Revises: 001
 Create Date: 2026-03-11 00:00:00.000000
 """
@@ -10,7 +10,7 @@ from __future__ import annotations
 from alembic import op
 import sqlalchemy as sa
 
-revision: str = "002"
+revision: str = "002_dedupe_market_bars"
 down_revision: str | None = "001"
 branch_labels: tuple[str, ...] | None = None
 depends_on: str | None = None
