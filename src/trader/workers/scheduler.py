@@ -9,6 +9,10 @@ BEAT_SCHEDULE: dict = {
         "task": "trader.workers.tasks.heartbeat_system",
         "schedule": 30.0,
     },
+    "open-order-management-30s": {
+        "task": "trader.workers.tasks.manage_open_orders",
+        "schedule": 30.0,
+    },
     "trading-cycle-1m": {
         "task": "trader.workers.tasks.execute_trading_cycle",
         "schedule": 60.0,

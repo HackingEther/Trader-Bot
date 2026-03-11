@@ -78,6 +78,10 @@ class Settings(BaseSettings):
     )
     min_confidence: float = Field(default=0.6)
     min_expected_move_bps: float = Field(default=15.0)
+    min_relative_volume: float = Field(default=0.8)
+    max_signals_per_cycle: int = Field(default=3)
+    limit_entry_buffer_bps: float = Field(default=5.0)
+    open_order_stale_seconds: int = Field(default=90)
 
     # ── Notifications ──
     slack_webhook_url: str = Field(default="")

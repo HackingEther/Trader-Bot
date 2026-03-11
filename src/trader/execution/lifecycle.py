@@ -45,9 +45,10 @@ class OrderLifecycleTracker:
         if error_message:
             updates["error_message"] = error_message
 
-        if new_status == OrderStatus.SUBMITTED:
+        if new_status in (OrderStatus.SUBMITTED, OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED):
             updates["submitted_at"] = now
         elif new_status == OrderStatus.FILLED:
+            updates["submitted_at"] = updates.get("submitted_at", now)
             updates["filled_at"] = now
         elif new_status == OrderStatus.CANCELLED:
             updates["cancelled_at"] = now

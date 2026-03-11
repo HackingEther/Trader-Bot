@@ -67,6 +67,13 @@ class HistoricalDataService:
         }
 
         inserted = 0
+        interval = "1m" if timeframe == "1Min" else timeframe.lower()
+        existing = await self._repo.get_existing_keys(
+            symbols,
+            start=start.astimezone(UTC),
+            end=end.astimezone(UTC),
+            interval=interval,
+        )
         async with httpx.AsyncClient(base_url="https://data.alpaca.markets", timeout=30.0) as client:
             next_page_token: str | None = None
             while True:
@@ -79,11 +86,16 @@ class HistoricalDataService:
 
                 for symbol, bars in payload.get("bars", {}).items():
                     for raw_bar in bars:
+                        timestamp = datetime.fromisoformat(raw_bar["t"].replace("Z", "+00:00"))
+                        key = (symbol, timestamp)
+                        if key in existing:
+                            continue
+                        existing.add(key)
                         self._session.add(
                             MarketBar(
                                 symbol=symbol,
-                                timestamp=datetime.fromisoformat(raw_bar["t"].replace("Z", "+00:00")),
-                                interval="1m" if timeframe == "1Min" else timeframe.lower(),
+                                timestamp=timestamp,
+                                interval=interval,
                                 open=Decimal(str(raw_bar["o"])),
                                 high=Decimal(str(raw_bar["h"])),
                                 low=Decimal(str(raw_bar["l"])),

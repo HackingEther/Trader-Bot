@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import DateTime, Index, Integer, Numeric, String
+from sqlalchemy import DateTime, Index, Integer, Numeric, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from trader.db.base import Base, TimestampMixin
@@ -29,6 +29,7 @@ class MarketBar(Base, TimestampMixin):
     __table_args__ = (
         Index("ix_market_bars_symbol_ts", "symbol", "timestamp"),
         Index("ix_market_bars_symbol_interval_ts", "symbol", "interval", "timestamp"),
+        UniqueConstraint("symbol", "interval", "timestamp", name="uq_market_bars_symbol_interval_ts"),
     )
 
     def __repr__(self) -> str:

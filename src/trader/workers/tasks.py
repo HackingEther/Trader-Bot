@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from decimal import Decimal
 
 import structlog
 
@@ -14,9 +15,14 @@ from trader.core.redis_client import init_redis
 from trader.db.session import get_session_factory, init_engine
 from trader.features.engine import FeatureEngine
 from trader.providers.broker.factory import create_broker_provider
+from trader.db.repositories.fills import FillRepository
+from trader.db.repositories.orders import OrderRepository
+from trader.execution.lifecycle import OrderLifecycleTracker
+from trader.execution.position_ledger import PositionLedger
 from trader.services.model_loader import ChampionModelLoader
 from trader.services.system_state import SystemStateStore
 from trader.services.trading_cycle import TradingCycleService
+from trader.strategy.engine import TradeIntentParams
 
 logger = structlog.get_logger(__name__)
 
@@ -66,6 +72,7 @@ def compute_features(symbol: str) -> dict:
             from trader.db.repositories.market_bars import MarketBarRepository
 
             repo = MarketBarRepository(session)
+            state_store = SystemStateStore()
             bars = await repo.get_recent(symbol, limit=400)
             engine = FeatureEngine(max_bars=400)
             for bar in bars:
@@ -83,7 +90,12 @@ def compute_features(symbol: str) -> dict:
                         interval=bar.interval,
                     )
                 )
-            features = engine.compute_features(symbol, bars[-1].timestamp if bars else None)
+            spread_bps = await state_store.get_spread_bps(symbol)
+            features = engine.compute_features(
+                symbol,
+                bars[-1].timestamp if bars else None,
+                spread_bps=spread_bps,
+            )
             logger.info(
                 "features_computed",
                 symbol=symbol,
@@ -107,6 +119,105 @@ def run_prediction(symbol: str, features: dict) -> dict:
             pipeline = await _model_loader.load_ensemble(session=session)
             prediction = pipeline.predict(symbol, features, datetime.now(timezone.utc))
             return prediction.model_dump(mode="json")
+
+    return asyncio.run(_run())
+
+
+@celery.task(name="trader.workers.tasks.manage_open_orders")
+def manage_open_orders() -> dict:
+    """Synchronize open orders with the broker and cancel stale orders."""
+
+    async def _run() -> dict:
+        settings, factory, broker = _bootstrap()
+        await _ensure_redis()
+        async with factory() as session:
+            orders = OrderRepository(session)
+            fills = FillRepository(session)
+            lifecycle = OrderLifecycleTracker(session)
+            ledger = PositionLedger(session)
+
+            open_orders = await orders.get_open_orders()
+            synced = 0
+            cancelled = 0
+            filled = 0
+            fill_recorded = 0
+            now = datetime.now(timezone.utc)
+
+            for order in open_orders:
+                if not order.broker_order_id:
+                    continue
+
+                broker_order = await broker.get_order(order.broker_order_id)
+                await lifecycle.update_status(
+                    order_id=order.id,
+                    new_status=broker_order.status,
+                    broker_order_id=broker_order.broker_order_id,
+                    filled_qty=broker_order.filled_qty,
+                    filled_avg_price=float(broker_order.filled_avg_price)
+                    if broker_order.filled_avg_price is not None
+                    else None,
+                )
+                synced += 1
+
+                if broker_order.status == "filled" and broker_order.filled_avg_price is not None:
+                    existing_fill = await fills.get_latest_by_order_id(order.id)
+                    if existing_fill is None:
+                        await lifecycle.record_fill(
+                            order_id=order.id,
+                            broker_order_id=broker_order.broker_order_id,
+                            symbol=order.symbol,
+                            side=order.side,
+                            qty=broker_order.filled_qty,
+                            price=float(broker_order.filled_avg_price),
+                        )
+                        synthetic_intent = TradeIntentParams(
+                            symbol=order.symbol,
+                            side=order.side,
+                            qty=broker_order.filled_qty,
+                            entry_order_type=order.order_type,
+                            limit_price=order.limit_price,
+                            strategy_tag=order.strategy_tag,
+                            rationale=order.rationale,
+                        )
+                        await ledger.apply_fill(
+                            order=order,
+                            intent=synthetic_intent,
+                            fill_price=broker_order.filled_avg_price,
+                            fill_qty=broker_order.filled_qty,
+                            commission=Decimal("0"),
+                            timestamp=order.filled_at or now,
+                        )
+                        fill_recorded += 1
+                    filled += 1
+                    continue
+
+                order_timestamp = order.submitted_at or order.created_at
+                if order_timestamp is None:
+                    continue
+                age_seconds = (now - order_timestamp).total_seconds()
+                if age_seconds <= settings.open_order_stale_seconds:
+                    continue
+                if broker_order.status not in {"pending", "submitted", "accepted", "partially_filled"}:
+                    continue
+
+                cancelled_order = await broker.cancel_order(order.broker_order_id)
+                await lifecycle.update_status(
+                    order_id=order.id,
+                    new_status=cancelled_order.status,
+                    broker_order_id=cancelled_order.broker_order_id,
+                )
+                cancelled += 1
+
+            await session.commit()
+            result = {
+                "open_orders_seen": len(open_orders),
+                "synced": synced,
+                "filled": filled,
+                "fills_recorded": fill_recorded,
+                "cancelled": cancelled,
+            }
+            logger.info("open_orders_managed", **result)
+            return result
 
     return asyncio.run(_run())
 

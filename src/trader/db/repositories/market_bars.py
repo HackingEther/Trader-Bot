@@ -46,6 +46,24 @@ class MarketBarRepository(BaseRepository[MarketBar]):
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
+    async def get_existing_keys(
+        self,
+        symbols: list[str],
+        *,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        interval: str = "1m",
+    ) -> set[tuple[str, datetime]]:
+        stmt = select(MarketBar.symbol, MarketBar.timestamp).where(MarketBar.interval == interval)
+        if symbols:
+            stmt = stmt.where(MarketBar.symbol.in_(symbols))
+        if start is not None:
+            stmt = stmt.where(MarketBar.timestamp >= start)
+        if end is not None:
+            stmt = stmt.where(MarketBar.timestamp <= end)
+        result = await self.session.execute(stmt)
+        return {(symbol, timestamp) for symbol, timestamp in result.all()}
+
     async def get_latest(self, symbol: str, interval: str = "1m") -> MarketBar | None:
         stmt = (
             select(MarketBar)

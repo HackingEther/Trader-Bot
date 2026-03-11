@@ -14,6 +14,7 @@ from trader.db.models.order import Order
 from trader.db.repositories.orders import OrderRepository
 from trader.execution.idempotency import generate_idempotency_key
 from trader.execution.lifecycle import OrderLifecycleTracker
+from trader.execution.position_ledger import PositionLedger
 from trader.providers.broker.base import BrokerProvider, OrderRequest
 from trader.services.system_state import SystemStateStore
 from trader.strategy.engine import TradeIntentParams
@@ -34,6 +35,7 @@ class ExecutionEngine:
         self._session = session
         self._repo = OrderRepository(session)
         self._lifecycle = OrderLifecycleTracker(session)
+        self._positions = PositionLedger(session)
         self._state_store = state_store or SystemStateStore()
 
     async def execute(self, intent: TradeIntentParams, trade_intent_id: int | None = None) -> Order:
@@ -111,6 +113,7 @@ class ExecutionEngine:
             order.broker_metadata = broker_order.raw
 
             if broker_order.status == OrderStatus.FILLED and broker_order.filled_avg_price:
+                fill_timestamp = order.filled_at or datetime.now(timezone.utc)
                 await self._lifecycle.record_fill(
                     order_id=order.id,
                     broker_order_id=broker_order.broker_order_id,
@@ -118,6 +121,13 @@ class ExecutionEngine:
                     side=intent.side,
                     qty=broker_order.filled_qty,
                     price=float(broker_order.filled_avg_price),
+                )
+                await self._positions.apply_fill(
+                    order=order,
+                    intent=intent,
+                    fill_price=broker_order.filled_avg_price,
+                    fill_qty=broker_order.filled_qty,
+                    timestamp=fill_timestamp,
                 )
 
             logger.info(

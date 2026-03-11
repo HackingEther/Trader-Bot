@@ -51,7 +51,12 @@ class FeatureEngine:
         """Add multiple bars at once (for backtest initialization)."""
         self._bars[symbol] = bars[-self._max_bars:]
 
-    def compute_features(self, symbol: str, timestamp: datetime | None = None) -> dict:
+    def compute_features(
+        self,
+        symbol: str,
+        timestamp: datetime | None = None,
+        spread_bps: float | None = None,
+    ) -> dict:
         """Compute the full feature vector for a symbol.
 
         Returns a dict of feature_name -> float suitable for model input and DB storage.
@@ -59,7 +64,7 @@ class FeatureEngine:
         bars = self._bars.get(symbol, [])
         if len(bars) < 2:
             logger.debug("insufficient_bars", symbol=symbol, count=len(bars))
-            return self._empty_features(timestamp)
+            return self._empty_features(timestamp, spread_bps=spread_bps)
 
         df = pd.DataFrame(bars)
         for col in ("open", "high", "low", "close", "vwap"):
@@ -120,7 +125,7 @@ class FeatureEngine:
             "momentum_15m": float(mom_15.iloc[last_idx]),
             "zscore_close_20": float(zs_close.iloc[last_idx]),
             "zscore_volume_20": float(zs_vol.iloc[last_idx]),
-            "spread_bps": 0.0,
+            "spread_bps": float(spread_bps or 0.0),
             "session_fraction": sess_frac,
             "minutes_since_open": mins,
             "time_bucket": float(t_bucket),
@@ -145,7 +150,7 @@ class FeatureEngine:
         else:
             self._bars.clear()
 
-    def _empty_features(self, timestamp: datetime | None = None) -> dict:
+    def _empty_features(self, timestamp: datetime | None = None, spread_bps: float | None = None) -> dict:
         ts = timestamp or datetime.now()
         return {
             "return_1m": 0.0,
@@ -164,7 +169,7 @@ class FeatureEngine:
             "momentum_15m": 0.0,
             "zscore_close_20": 0.0,
             "zscore_volume_20": 0.0,
-            "spread_bps": 0.0,
+            "spread_bps": float(spread_bps or 0.0),
             "session_fraction": session_fraction(ts),
             "minutes_since_open": minutes_since_open(ts),
             "time_bucket": float(time_bucket(minutes_since_open(ts))),

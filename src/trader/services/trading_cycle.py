@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from trader.config import Settings
 from trader.core.events import ModelPrediction
 from trader.core.exceptions import DuplicateOrderError, KillSwitchActiveError, OrderSubmissionError
-from trader.core.time_utils import now_utc
+from trader.core.time_utils import now_utc, to_et
 from trader.db.models.model_prediction import ModelPredictionRecord
 from trader.db.models.risk_decision import RiskDecisionRecord
 from trader.db.models.trade_intent import TradeIntent
@@ -45,6 +45,18 @@ class SymbolCycleResult:
     reason: str = ""
     trade_intent_id: int | None = None
     order_id: int | None = None
+
+
+@dataclass
+class PreparedSignal:
+    symbol: str
+    latest_bar: object
+    features: dict[str, float]
+    prediction: ModelPrediction
+    prediction_record: ModelPredictionRecord
+    intent: TradeIntentParams
+    intent_record: TradeIntent
+    score: float
 
 
 class TradingCycleService:
@@ -92,27 +104,74 @@ class TradingCycleService:
 
         account = await self._broker.get_account()
         pipeline = await self._model_loader.load_ensemble(session=self._session)
+        candidates: list[PreparedSignal] = []
 
         for symbol in symbols:
             try:
-                outcome = await self._process_symbol(symbol, account_equity=account.equity, pipeline=pipeline)
+                prepared = await self._prepare_symbol(symbol, account_equity=account.equity, pipeline=pipeline)
             except Exception as exc:
                 logger.error("trading_cycle_symbol_failed", symbol=symbol, error=str(exc))
-                outcome = SymbolCycleResult(symbol=symbol, status="error", reason=str(exc))
-            results["symbols"].append(outcome.__dict__)
-            if outcome.status == "no_bars":
-                results["skipped_no_bars"] += 1
+                self._record_result(results, SymbolCycleResult(symbol=symbol, status="error", reason=str(exc)))
                 continue
 
-            results["symbols_processed"] += 1
-            if outcome.status in {"predicted", "approved", "rejected", "executed", "duplicate", "error"}:
-                results["predictions_persisted"] += 1
-            if outcome.trade_intent_id:
-                results["intents_generated"] += 1
-            if outcome.status == "executed":
-                results["orders_submitted"] += 1
-            if outcome.status == "rejected":
-                results["orders_rejected"] += 1
+            if isinstance(prepared, SymbolCycleResult):
+                self._record_result(results, prepared)
+            else:
+                candidates.append(prepared)
+
+        selected = sorted(candidates, key=lambda candidate: candidate.score, reverse=True)[
+            : max(1, self._settings.max_signals_per_cycle)
+        ]
+        selected_ids = {candidate.intent_record.id for candidate in selected}
+
+        open_positions = await self._positions.get_open_positions()
+        projected_total_exposure = sum((position.market_value or Decimal("0")) for position in open_positions)
+        projected_open_count = len(open_positions)
+        projected_symbol_exposure = {
+            position.symbol: (position.market_value or Decimal("0")) for position in open_positions
+        }
+
+        for candidate in candidates:
+            if candidate.intent_record.id not in selected_ids:
+                await self._trade_intents.update_by_id(candidate.intent_record.id, status="cancelled")
+                self._record_result(
+                    results,
+                    SymbolCycleResult(
+                        symbol=candidate.symbol,
+                        status="predicted",
+                        reason="ranked_out",
+                        trade_intent_id=candidate.intent_record.id,
+                    ),
+                )
+                continue
+
+            try:
+                outcome = await self._execute_candidate(
+                    candidate,
+                    projected_total_exposure=projected_total_exposure,
+                    projected_open_count=projected_open_count,
+                    projected_symbol_exposure=projected_symbol_exposure.get(
+                        candidate.symbol, Decimal("0")
+                    ),
+                )
+            except Exception as exc:
+                logger.error("trading_cycle_execution_failed", symbol=candidate.symbol, error=str(exc))
+                outcome = SymbolCycleResult(
+                    symbol=candidate.symbol,
+                    status="error",
+                    reason=str(exc),
+                    trade_intent_id=candidate.intent_record.id,
+                )
+
+            if outcome.status in {"executed", "approved"}:
+                projected_notional = candidate.latest_bar.close * candidate.intent.qty
+                projected_total_exposure += projected_notional
+                projected_open_count += 1
+                projected_symbol_exposure[candidate.symbol] = (
+                    projected_symbol_exposure.get(candidate.symbol, Decimal("0")) + projected_notional
+                )
+
+            self._record_result(results, outcome)
 
         await self._session.commit()
         return results
@@ -165,13 +224,13 @@ class TradingCycleService:
             "kill_switch_activated": halt_on_discrepancy and material_discrepancy,
         }
 
-    async def _process_symbol(
+    async def _prepare_symbol(
         self,
         symbol: str,
         *,
         account_equity: Decimal,
         pipeline,
-    ) -> SymbolCycleResult:
+    ) -> SymbolCycleResult | PreparedSignal:
         bars = await self._market_bars.get_recent(symbol, limit=400)
         if len(bars) < 20:
             return SymbolCycleResult(symbol=symbol, status="no_bars", reason="insufficient_history")
@@ -181,7 +240,8 @@ class TradingCycleService:
 
         latest_bar = bars[-1]
         timestamp = latest_bar.timestamp
-        features = feature_engine.compute_features(symbol, timestamp)
+        spread_bps = await self._state_store.get_spread_bps(symbol)
+        features = feature_engine.compute_features(symbol, timestamp, spread_bps=spread_bps)
         feature_snapshot = await self._feature_snapshots.create(
             symbol=symbol,
             timestamp=timestamp,
@@ -200,6 +260,9 @@ class TradingCycleService:
             sizer=PositionSizer(),
             min_confidence=self._settings.min_confidence,
             min_expected_move_bps=self._settings.min_expected_move_bps,
+            min_relative_volume=self._settings.min_relative_volume,
+            max_spread_bps=self._settings.spread_threshold_bps,
+            limit_entry_buffer_bps=self._settings.limit_entry_buffer_bps,
         )
 
         has_broker_position = await self._broker.get_position(symbol) is not None
@@ -208,53 +271,82 @@ class TradingCycleService:
             current_price=latest_bar.close,
             account_equity=account_equity,
             has_open_position=has_broker_position,
+            features=features,
+            current_spread_bps=spread_bps,
         )
         if intent is None:
             return SymbolCycleResult(symbol=symbol, status="predicted", reason="strategy_filtered")
 
         intent.model_prediction_id = prediction_record.id
         intent_record = await self._persist_trade_intent(intent, timestamp=timestamp)
+        score = self._score_candidate(prediction=prediction, features=features)
+        return PreparedSignal(
+            symbol=symbol,
+            latest_bar=latest_bar,
+            features=features,
+            prediction=prediction,
+            prediction_record=prediction_record,
+            intent=intent,
+            intent_record=intent_record,
+            score=score,
+        )
 
-        risk_decision = await self._evaluate_and_persist_risk(intent, intent_record.id, latest_bar.close, timestamp)
+    async def _execute_candidate(
+        self,
+        candidate: PreparedSignal,
+        *,
+        projected_total_exposure: Decimal,
+        projected_open_count: int,
+        projected_symbol_exposure: Decimal,
+    ) -> SymbolCycleResult:
+        risk_decision = await self._evaluate_and_persist_risk(
+            candidate.intent,
+            candidate.intent_record.id,
+            candidate.latest_bar.close,
+            candidate.latest_bar.timestamp,
+            projected_total_exposure=projected_total_exposure,
+            projected_open_count=projected_open_count,
+            projected_symbol_exposure=projected_symbol_exposure,
+        )
         if not risk_decision.approved:
-            await self._trade_intents.update_by_id(intent_record.id, status="rejected")
+            await self._trade_intents.update_by_id(candidate.intent_record.id, status="rejected")
             return SymbolCycleResult(
-                symbol=symbol,
+                symbol=candidate.symbol,
                 status="rejected",
                 reason="; ".join(risk_decision.reasons),
-                trade_intent_id=intent_record.id,
+                trade_intent_id=candidate.intent_record.id,
             )
 
-        await self._trade_intents.update_by_id(intent_record.id, status="approved")
+        await self._trade_intents.update_by_id(candidate.intent_record.id, status="approved")
         try:
             execution = ExecutionEngine(
                 broker=self._broker,
                 session=self._session,
                 state_store=self._state_store,
             )
-            order = await execution.execute(intent, trade_intent_id=intent_record.id)
-            await self._trade_intents.update_by_id(intent_record.id, status="executed")
+            order = await execution.execute(candidate.intent, trade_intent_id=candidate.intent_record.id)
+            await self._trade_intents.update_by_id(candidate.intent_record.id, status="executed")
             return SymbolCycleResult(
-                symbol=symbol,
+                symbol=candidate.symbol,
                 status="executed",
-                trade_intent_id=intent_record.id,
+                trade_intent_id=candidate.intent_record.id,
                 order_id=order.id,
             )
         except DuplicateOrderError:
-            await self._trade_intents.update_by_id(intent_record.id, status="cancelled")
+            await self._trade_intents.update_by_id(candidate.intent_record.id, status="cancelled")
             return SymbolCycleResult(
-                symbol=symbol,
+                symbol=candidate.symbol,
                 status="duplicate",
                 reason="duplicate_order",
-                trade_intent_id=intent_record.id,
+                trade_intent_id=candidate.intent_record.id,
             )
         except (KillSwitchActiveError, OrderSubmissionError) as exc:
-            await self._trade_intents.update_by_id(intent_record.id, status="cancelled")
+            await self._trade_intents.update_by_id(candidate.intent_record.id, status="cancelled")
             return SymbolCycleResult(
-                symbol=symbol,
+                symbol=candidate.symbol,
                 status="rejected",
                 reason=str(exc),
-                trade_intent_id=intent_record.id,
+                trade_intent_id=candidate.intent_record.id,
             )
 
     async def _persist_prediction(self, prediction: ModelPrediction) -> ModelPredictionRecord:
@@ -296,17 +388,32 @@ class TradingCycleService:
         trade_intent_id: int,
         entry_price: Decimal,
         timestamp: datetime,
+        *,
+        projected_total_exposure: Decimal | None = None,
+        projected_open_count: int | None = None,
+        projected_symbol_exposure: Decimal | None = None,
     ):
         if await self._state_store.is_kill_switch_active():
-            decision = _InlineDecision(approved=False, reasons=["[kill_switch] Kill switch is active"], rule_results={"circuit_breaker": False})
+            decision = _InlineDecision(
+                approved=False,
+                reasons=["[kill_switch] Kill switch is active"],
+                rule_results={"circuit_breaker": False},
+            )
             await self._persist_risk_decision(trade_intent_id, decision, timestamp)
             return decision
 
-        latest_snapshot = await self._pnl.get_latest()
-        open_positions = await self._positions.get_open_positions()
-        symbol_position = await self._positions.get_open_by_symbol(intent.symbol)
-        spread_bps = await self._state_store.get_spread_bps(intent.symbol)
+        all_positions = await self._positions.get_all(limit=5000)
+        open_positions = [position for position in all_positions if position.status == "open"]
         last_bar_time = await self._state_store.get_last_bar_timestamp(intent.symbol)
+        spread_bps = intent.rationale.get("spread_bps")
+        if spread_bps is None:
+            decision = _InlineDecision(
+                approved=False,
+                reasons=["[spread] No recent quote spread available"],
+                rule_results={"spread": False},
+            )
+            await self._persist_risk_decision(trade_intent_id, decision, timestamp)
+            return decision
 
         risk = RiskEngine(
             max_daily_loss=self._settings.max_daily_loss_usd,
@@ -318,12 +425,20 @@ class TradingCycleService:
             max_spread_bps=self._settings.spread_threshold_bps,
         )
         context = RiskContext(
-            daily_realized_pnl=latest_snapshot.realized_pnl if latest_snapshot else Decimal("0"),
-            current_exposure=sum((p.market_value or Decimal("0")) for p in open_positions),
-            symbol_exposure=(symbol_position.market_value or Decimal("0")) if symbol_position else Decimal("0"),
-            open_position_count=len(open_positions),
-            consecutive_losses=self._count_consecutive_losses(),
-            spread_bps=spread_bps or 0.0,
+            daily_realized_pnl=self._daily_realized_pnl(all_positions),
+            current_exposure=projected_total_exposure
+            if projected_total_exposure is not None
+            else sum((p.market_value or Decimal("0")) for p in open_positions),
+            symbol_exposure=projected_symbol_exposure
+            if projected_symbol_exposure is not None
+            else sum(
+                (position.market_value or Decimal("0"))
+                for position in open_positions
+                if position.symbol == intent.symbol
+            ),
+            open_position_count=projected_open_count if projected_open_count is not None else len(open_positions),
+            consecutive_losses=self._count_consecutive_losses(all_positions),
+            spread_bps=float(spread_bps),
             last_data_time=last_bar_time,
             entry_price=entry_price,
         )
@@ -340,8 +455,70 @@ class TradingCycleService:
             timestamp=timestamp,
         )
 
-    def _count_consecutive_losses(self) -> int:
-        return 0
+    def _count_consecutive_losses(self, positions: list | None = None) -> int:
+        all_positions = positions or []
+        closed_positions = sorted(
+            [position for position in all_positions if position.status == "closed" and position.closed_at],
+            key=lambda position: position.closed_at or now_utc(),
+            reverse=True,
+        )
+        losses = 0
+        for position in closed_positions:
+            if position.realized_pnl < 0:
+                losses += 1
+                continue
+            break
+        return losses
+
+    def _daily_realized_pnl(self, positions: list) -> Decimal:
+        session_date = to_et(now_utc()).date()
+        realized = Decimal("0")
+        for position in positions:
+            if position.status != "closed" or position.closed_at is None:
+                continue
+            if to_et(position.closed_at).date() == session_date:
+                realized += position.realized_pnl
+        return realized
+
+    def _score_candidate(self, *, prediction: ModelPrediction, features: dict[str, float]) -> float:
+        relative_volume = max(0.1, float(features.get("relative_volume", 1.0)))
+        spread_bps = max(0.0, float(features.get("spread_bps", 0.0)))
+        momentum_bonus = abs(float(features.get("momentum_5m", 0.0))) + abs(
+            float(features.get("momentum_15m", 0.0))
+        )
+        regime_multiplier = {
+            "trending_up": 1.15,
+            "trending_down": 1.15,
+            "high_volatility": 1.05,
+            "mean_reverting": 1.0,
+            "low_volatility": 0.95,
+        }.get(prediction.regime, 1.0)
+        spread_penalty = 1.0 / (1.0 + spread_bps / 10.0)
+        return (
+            prediction.confidence
+            * prediction.expected_move_bps
+            * max(0.1, 1.0 - prediction.no_trade_score)
+            * regime_multiplier
+            * max(0.5, relative_volume)
+            * max(1.0, momentum_bonus * 100.0)
+            * spread_penalty
+        )
+
+    def _record_result(self, results: dict, outcome: SymbolCycleResult) -> None:
+        results["symbols"].append(outcome.__dict__)
+        if outcome.status == "no_bars":
+            results["skipped_no_bars"] += 1
+            return
+
+        results["symbols_processed"] += 1
+        if outcome.status in {"predicted", "approved", "rejected", "executed", "duplicate", "error"}:
+            results["predictions_persisted"] += 1
+        if outcome.trade_intent_id:
+            results["intents_generated"] += 1
+        if outcome.status == "executed":
+            results["orders_submitted"] += 1
+        if outcome.status == "rejected":
+            results["orders_rejected"] += 1
 
     @staticmethod
     def _bar_to_dict(bar) -> dict:

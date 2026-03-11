@@ -73,6 +73,8 @@ class RiskEngine:
         cooldown_losses: int = 3,
         max_spread_bps: float = 50.0,
         max_data_age: float = 30.0,
+        enforce_stale_data: bool = True,
+        enforce_market_hours: bool = True,
     ) -> None:
         self._circuit_breaker = CircuitBreakerRule()
         self._rules = {
@@ -84,9 +86,11 @@ class RiskEngine:
             "symbol_exposure": SymbolExposureRule(max_per_symbol),
             "cooldown": CooldownRule(cooldown_losses),
             "spread": SpreadRule(max_spread_bps),
-            "stale_data": StaleDataRule(max_data_age),
-            "market_hours": MarketHoursRule(),
         }
+        if enforce_stale_data:
+            self._rules["stale_data"] = StaleDataRule(max_data_age)
+        if enforce_market_hours:
+            self._rules["market_hours"] = MarketHoursRule()
 
     @property
     def kill_switch(self) -> CircuitBreakerRule:
