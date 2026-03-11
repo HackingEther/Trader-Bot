@@ -6,10 +6,10 @@ from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import DateTime, Index, Integer, Numeric, String
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from trader.db.base import Base, TimestampMixin
+from trader.db.types import JSONVariant
 
 
 class Position(Base, TimestampMixin):
@@ -29,7 +29,7 @@ class Position(Base, TimestampMixin):
     trade_intent_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    metadata_: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False, default=dict)
+    metadata_: Mapped[dict] = mapped_column("metadata", JSONVariant, nullable=False, default=dict)
 
     __table_args__ = (
         Index("ix_positions_symbol_status", "symbol", "status"),

@@ -5,10 +5,10 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import DateTime, Float, Integer, String, Text
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from trader.db.base import Base, TimestampMixin
+from trader.db.types import JSONVariant
 
 
 class BacktestRun(Base, TimestampMixin):
@@ -19,10 +19,10 @@ class BacktestRun(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="running")
     start_date: Mapped[str] = mapped_column(String(10), nullable=False)
     end_date: Mapped[str] = mapped_column(String(10), nullable=False)
-    symbols: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
-    strategy_config: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
-    risk_config: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
-    slippage_config: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    symbols: Mapped[list] = mapped_column(JSONVariant, nullable=False, default=list)
+    strategy_config: Mapped[dict] = mapped_column(JSONVariant, nullable=False, default=dict)
+    risk_config: Mapped[dict] = mapped_column(JSONVariant, nullable=False, default=dict)
+    slippage_config: Mapped[dict] = mapped_column(JSONVariant, nullable=False, default=dict)
 
     # Results metrics
     total_trades: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -36,7 +36,7 @@ class BacktestRun(Base, TimestampMixin):
     profit_factor: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     avg_hold_minutes: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     turnover: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
-    detailed_metrics: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    detailed_metrics: Mapped[dict] = mapped_column(JSONVariant, nullable=False, default=dict)
 
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 
 import structlog
 
@@ -17,6 +18,7 @@ from trader.features.engine import FeatureEngine
 from trader.providers.broker.factory import create_broker_provider
 from trader.db.repositories.fills import FillRepository
 from trader.db.repositories.orders import OrderRepository
+from trader.db.repositories.trade_intents import TradeIntentRepository
 from trader.execution.lifecycle import OrderLifecycleTracker
 from trader.execution.position_ledger import PositionLedger
 from trader.services.model_loader import ChampionModelLoader
@@ -51,6 +53,85 @@ async def _ensure_redis() -> None:
         await init_redis(settings.redis_url)
     except Exception:
         logger.warning("redis_bootstrap_failed", url=settings.redis_url)
+
+
+def _tracked_fill_qty(existing_fills: list) -> int:
+    """Sum recorded fill quantity for an order."""
+    return sum(int(fill.qty) for fill in existing_fills)
+
+
+def _tracked_fill_notional(existing_fills: list) -> Decimal:
+    """Sum recorded fill notional for an order."""
+    return sum((Decimal(fill.price) * int(fill.qty) for fill in existing_fills), Decimal("0"))
+
+
+def _incremental_fill_price(
+    *,
+    cumulative_qty: int,
+    cumulative_avg_price: Decimal,
+    recorded_qty: int,
+    recorded_notional: Decimal,
+) -> Decimal:
+    """Infer delta fill price from cumulative broker state when no execution details exist."""
+    total_notional = cumulative_avg_price * cumulative_qty
+    delta_qty = cumulative_qty - recorded_qty
+    if delta_qty <= 0:
+        return cumulative_avg_price
+    delta_notional = total_notional - recorded_notional
+    return delta_notional / delta_qty
+
+
+def _coerce_utc(value: datetime) -> datetime:
+    """Normalize timestamps loaded from different backends."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _fill_timestamp_from_raw(raw: dict | None, fallback: datetime) -> datetime:
+    if not raw:
+        return fallback
+    for key in ("filled_at", "updated_at", "submitted_at"):
+        value = raw.get(key)
+        if not value:
+            continue
+        try:
+            return _coerce_utc(datetime.fromisoformat(str(value)))
+        except ValueError:
+            continue
+    return fallback
+
+
+def _execution_key(broker_order_id: str | None, cumulative_qty: int) -> str | None:
+    if not broker_order_id or cumulative_qty <= 0:
+        return None
+    return f"{broker_order_id}:{cumulative_qty}"
+
+
+def _embedded_leg_orders(snapshot) -> list[SimpleNamespace]:
+    legs = []
+    raw = getattr(snapshot, "raw", None) or {}
+    for leg in raw.get("legs", []) or []:
+        legs.append(
+            SimpleNamespace(
+                broker_order_id=str(leg.get("alpaca_id") or ""),
+                symbol=str(leg.get("symbol") or getattr(snapshot, "symbol", "")),
+                side=str(leg.get("side") or ""),
+                order_type=str(leg.get("order_type") or "market"),
+                qty=int(leg.get("qty") or getattr(snapshot, "qty", 0)),
+                limit_price=Decimal(str(leg["limit_price"])) if leg.get("limit_price") not in (None, "") else None,
+                stop_price=Decimal(str(leg["stop_price"])) if leg.get("stop_price") not in (None, "") else None,
+                filled_qty=int(leg.get("filled_qty") or 0),
+                filled_avg_price=Decimal(str(leg["filled_avg_price"]))
+                if leg.get("filled_avg_price") not in (None, "")
+                else None,
+                status=str(leg.get("status") or "pending"),
+                order_class="simple",
+                time_in_force=str(leg.get("time_in_force") or "day"),
+                raw=leg,
+            )
+        )
+    return [leg for leg in legs if leg.broker_order_id]
 
 
 @celery.task(name="trader.workers.tasks.heartbeat_system")
@@ -133,21 +214,13 @@ def manage_open_orders() -> dict:
         async with factory() as session:
             orders = OrderRepository(session)
             fills = FillRepository(session)
+            trade_intents = TradeIntentRepository(session)
             lifecycle = OrderLifecycleTracker(session)
             ledger = PositionLedger(session)
 
-            open_orders = await orders.get_open_orders()
-            synced = 0
-            cancelled = 0
-            filled = 0
-            fill_recorded = 0
-            now = datetime.now(timezone.utc)
-
-            for order in open_orders:
-                if not order.broker_order_id:
-                    continue
-
-                broker_order = await broker.get_order(order.broker_order_id)
+            async def _sync_snapshot(order, broker_order) -> tuple[int, int]:
+                recorded = 0
+                completed = 0
                 await lifecycle.update_status(
                     order_id=order.id,
                     new_status=broker_order.status,
@@ -157,23 +230,52 @@ def manage_open_orders() -> dict:
                     if broker_order.filled_avg_price is not None
                     else None,
                 )
-                synced += 1
+                order.broker_metadata = getattr(broker_order, "raw", {}) or {}
 
-                if broker_order.status == "filled" and broker_order.filled_avg_price is not None:
-                    existing_fill = await fills.get_latest_by_order_id(order.id)
-                    if existing_fill is None:
+                if order.trade_intent_id is not None:
+                    if broker_order.status in {"partially_filled", "filled"}:
+                        await trade_intents.update_by_id(order.trade_intent_id, status="executed")
+                    elif broker_order.status in {"rejected", "failed"}:
+                        await trade_intents.update_by_id(order.trade_intent_id, status="rejected")
+                    elif broker_order.status in {"cancelled", "expired"}:
+                        await trade_intents.update_by_id(order.trade_intent_id, status="cancelled")
+
+                if (
+                    broker_order.status in {"partially_filled", "filled"}
+                    and broker_order.filled_avg_price is not None
+                    and broker_order.filled_qty > 0
+                ):
+                    existing_fills = await fills.get_by_order_id(order.id)
+                    recorded_qty = _tracked_fill_qty(existing_fills)
+                    recorded_notional = _tracked_fill_notional(existing_fills)
+                    delta_qty = int(broker_order.filled_qty) - recorded_qty
+                    if delta_qty > 0:
+                        delta_fill_price = _incremental_fill_price(
+                            cumulative_qty=int(broker_order.filled_qty),
+                            cumulative_avg_price=broker_order.filled_avg_price,
+                            recorded_qty=recorded_qty,
+                            recorded_notional=recorded_notional,
+                        )
+                        fill_timestamp = _fill_timestamp_from_raw(
+                            getattr(broker_order, "raw", None),
+                            order.filled_at or order.submitted_at or now,
+                        )
                         await lifecycle.record_fill(
                             order_id=order.id,
                             broker_order_id=broker_order.broker_order_id,
                             symbol=order.symbol,
                             side=order.side,
-                            qty=broker_order.filled_qty,
-                            price=float(broker_order.filled_avg_price),
+                            qty=delta_qty,
+                            price=float(delta_fill_price),
+                            execution_key=_execution_key(broker_order.broker_order_id, int(broker_order.filled_qty)),
+                            broker_execution_timestamp=fill_timestamp,
+                            timestamp=fill_timestamp,
+                            raw=getattr(broker_order, "raw", None),
                         )
                         synthetic_intent = TradeIntentParams(
                             symbol=order.symbol,
                             side=order.side,
-                            qty=broker_order.filled_qty,
+                            qty=delta_qty,
                             entry_order_type=order.order_type,
                             limit_price=order.limit_price,
                             strategy_tag=order.strategy_tag,
@@ -182,31 +284,89 @@ def manage_open_orders() -> dict:
                         await ledger.apply_fill(
                             order=order,
                             intent=synthetic_intent,
-                            fill_price=broker_order.filled_avg_price,
-                            fill_qty=broker_order.filled_qty,
+                            fill_price=delta_fill_price,
+                            fill_qty=delta_qty,
                             commission=Decimal("0"),
-                            timestamp=order.filled_at or now,
+                            timestamp=fill_timestamp,
                         )
-                        fill_recorded += 1
-                    filled += 1
+                        recorded += 1
+
+                for leg_snapshot in _embedded_leg_orders(broker_order):
+                    child_order = await orders.get_by_broker_order_id(leg_snapshot.broker_order_id)
+                    if child_order is None:
+                        child_order, _ = await orders.create_idempotent(
+                            idempotency_key=f"broker-child:{leg_snapshot.broker_order_id}",
+                            trade_intent_id=order.trade_intent_id,
+                            broker_order_id=leg_snapshot.broker_order_id,
+                            symbol=leg_snapshot.symbol or order.symbol,
+                            side=leg_snapshot.side or ("sell" if order.side == "buy" else "buy"),
+                            order_type=leg_snapshot.order_type,
+                            order_class="simple",
+                            qty=leg_snapshot.qty,
+                            limit_price=leg_snapshot.limit_price,
+                            stop_price=leg_snapshot.stop_price,
+                            status=leg_snapshot.status,
+                            strategy_tag=order.strategy_tag,
+                            rationale=order.rationale,
+                            broker_metadata={
+                                **getattr(leg_snapshot, "raw", {}),
+                                "parent_order_id": order.broker_order_id,
+                            },
+                        )
+                    child_recorded, child_completed = await _sync_snapshot(child_order, leg_snapshot)
+                    recorded += child_recorded
+                    completed += child_completed
+
+                if broker_order.status == "filled":
+                    completed += 1
+                return recorded, completed
+
+            open_orders = await orders.get_open_orders()
+            synced = 0
+            cancelled = 0
+            filled = 0
+            fill_recorded = 0
+            errors = 0
+            now = datetime.now(timezone.utc)
+
+            for order in open_orders:
+                if not order.broker_order_id:
                     continue
 
-                order_timestamp = order.submitted_at or order.created_at
-                if order_timestamp is None:
-                    continue
-                age_seconds = (now - order_timestamp).total_seconds()
-                if age_seconds <= settings.open_order_stale_seconds:
-                    continue
-                if broker_order.status not in {"pending", "submitted", "accepted", "partially_filled"}:
-                    continue
+                try:
+                    broker_order = await broker.get_order(order.broker_order_id)
+                    recorded_delta, completed_delta = await _sync_snapshot(order, broker_order)
+                    synced += 1
+                    fill_recorded += recorded_delta
+                    filled += completed_delta
+                    if broker_order.status == "filled":
+                        continue
 
-                cancelled_order = await broker.cancel_order(order.broker_order_id)
-                await lifecycle.update_status(
-                    order_id=order.id,
-                    new_status=cancelled_order.status,
-                    broker_order_id=cancelled_order.broker_order_id,
-                )
-                cancelled += 1
+                    if broker_order.status == "partially_filled":
+                        continue
+
+                    age_anchor = _coerce_utc(order.submitted_at or order.created_at)
+                    age_seconds = (now - age_anchor).total_seconds()
+                    if age_seconds <= settings.open_order_stale_seconds:
+                        continue
+                    if broker_order.status not in {"pending", "submitted", "accepted", "partially_filled"}:
+                        continue
+
+                    cancelled_order = await broker.cancel_order(order.broker_order_id)
+                    await lifecycle.update_status(
+                        order_id=order.id,
+                        new_status=cancelled_order.status,
+                        broker_order_id=cancelled_order.broker_order_id,
+                    )
+                    cancelled += 1
+                except Exception as exc:
+                    errors += 1
+                    logger.exception(
+                        "open_order_sync_failed",
+                        order_id=order.id,
+                        broker_order_id=order.broker_order_id,
+                        error=str(exc),
+                    )
 
             await session.commit()
             result = {
@@ -215,6 +375,7 @@ def manage_open_orders() -> dict:
                 "filled": filled,
                 "fills_recorded": fill_recorded,
                 "cancelled": cancelled,
+                "errors": errors,
             }
             logger.info("open_orders_managed", **result)
             return result
@@ -259,7 +420,7 @@ def reconcile_positions() -> dict:
                 model_loader=_model_loader,
                 state_store=SystemStateStore(),
             )
-            result = await service.reconcile_positions(auto_fix=True, halt_on_discrepancy=True)
+            result = await service.reconcile_positions(auto_fix=False, halt_on_discrepancy=True)
             logger.info("reconciliation_task_completed", **result)
             return result
 

@@ -70,12 +70,14 @@ class PositionLedger:
 
         close_qty = min(existing.qty, fill_qty)
         remaining_qty = existing.qty - close_qty
+        close_commission = commission * Decimal(close_qty) / Decimal(fill_qty)
+        open_commission = commission - close_commission
         realized = self._realized_pnl(
             side=existing.side,
             avg_entry_price=existing.avg_entry_price,
             exit_price=fill_price,
             qty=close_qty,
-        ) - commission
+        ) - close_commission
 
         existing.realized_pnl += realized
         existing.current_price = fill_price
@@ -112,7 +114,7 @@ class PositionLedger:
             current_price=fill_price,
             market_value=fill_price * flip_qty,
             unrealized_pnl=Decimal("0"),
-            realized_pnl=Decimal("0"),
+            realized_pnl=-open_commission,
             status="open",
             strategy_tag=order.strategy_tag,
             trade_intent_id=order.trade_intent_id,

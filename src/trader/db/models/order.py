@@ -6,10 +6,10 @@ from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import DateTime, Index, Integer, Numeric, String
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from trader.db.base import Base, TimestampMixin
+from trader.db.types import JSONVariant
 
 
 class Order(Base, TimestampMixin):
@@ -31,8 +31,8 @@ class Order(Base, TimestampMixin):
     filled_avg_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 4), nullable=True)
     status: Mapped[str] = mapped_column(String(30), nullable=False, default="pending", index=True)
     strategy_tag: Mapped[str] = mapped_column(String(50), nullable=False, default="default")
-    rationale: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
-    broker_metadata: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    rationale: Mapped[dict] = mapped_column(JSONVariant, nullable=False, default=dict)
+    broker_metadata: Mapped[dict] = mapped_column(JSONVariant, nullable=False, default=dict)
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     filled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

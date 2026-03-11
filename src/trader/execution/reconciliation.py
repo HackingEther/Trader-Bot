@@ -59,7 +59,9 @@ class PositionReconciler:
             lp = local_map.get(symbol)
 
             if bp and lp:
-                if bp.qty == lp.qty and bp.side == lp.side:
+                avg_entry_matches = bp.avg_entry_price == lp.avg_entry_price
+                current_price_matches = bp.current_price == lp.current_price or lp.current_price is None
+                if bp.qty == lp.qty and bp.side == lp.side and avg_entry_matches and current_price_matches:
                     result.matched.append(symbol)
                     if auto_fix and bp.current_price:
                         lp.current_price = bp.current_price
@@ -72,10 +74,15 @@ class PositionReconciler:
                         "broker_side": bp.side,
                         "local_qty": lp.qty,
                         "local_side": lp.side,
+                        "broker_avg_entry_price": str(bp.avg_entry_price),
+                        "local_avg_entry_price": str(lp.avg_entry_price),
+                        "broker_current_price": str(bp.current_price),
+                        "local_current_price": str(lp.current_price) if lp.current_price is not None else None,
                     })
                     if auto_fix:
                         lp.qty = bp.qty
                         lp.side = bp.side
+                        lp.avg_entry_price = bp.avg_entry_price
                         lp.current_price = bp.current_price
                         lp.market_value = bp.market_value
                         lp.unrealized_pnl = bp.unrealized_pnl
@@ -92,8 +99,10 @@ class PositionReconciler:
                         current_price=bp.current_price,
                         market_value=bp.market_value,
                         unrealized_pnl=bp.unrealized_pnl,
+                        realized_pnl=Decimal("0"),
                         status="open",
                         opened_at=datetime.now(timezone.utc),
+                        metadata_={"reconciliation_source": "broker_snapshot"},
                     )
                     self._session.add(new_pos)
                     logger.warning("position_created_from_broker", symbol=symbol)

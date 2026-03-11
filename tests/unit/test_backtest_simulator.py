@@ -151,3 +151,64 @@ def test_backtest_short_cash_flow_matches_realized_pnl() -> None:
     assert results["total_trades"] == 1
     assert results["final_equity"] == pytest.approx(1000.0 + results["total_pnl"], abs=1e-6)
     assert simulator._cash == pytest.approx(results["final_equity"], abs=1e-6)
+
+
+def test_backtest_enters_on_next_bar_open_not_signal_bar() -> None:
+    bars = _bars(100.0, [0.2] * 16 + [5.0, 0.0])
+    simulator = BacktestSimulator(
+        symbols=["AAPL"],
+        strategy_config={
+            "min_history_bars": 16,
+            "min_confidence": 0.0,
+            "min_expected_move_bps": 0.0,
+            "min_relative_volume": 0.0,
+            "max_position_value": 101.0,
+            "risk_per_trade_pct": 1.0,
+        },
+        slippage=SlippageModel(fixed_bps=0.0),
+        commission=CommissionModel(),
+        initial_capital=1000.0,
+        ensemble=_SequencedEnsemble(
+            [
+                _prediction("long", "trending_up"),
+                _prediction("no_trade", "low_volatility"),
+            ]
+        ),
+    )
+
+    simulator.run({"AAPL": bars})
+
+    closed_trade = simulator._closed_trades[0]
+    assert closed_trade.entry_price == bars[16]["open"]
+    assert closed_trade.entry_price != bars[15]["close"]
+
+
+def test_backtest_force_closes_open_position_at_last_bar() -> None:
+    bars = _bars(100.0, [0.2] * 16 + [0.1, 0.0])
+    simulator = BacktestSimulator(
+        symbols=["AAPL"],
+        strategy_config={
+            "min_history_bars": 16,
+            "min_confidence": 0.0,
+            "min_expected_move_bps": 0.0,
+            "min_relative_volume": 0.0,
+            "max_position_value": 101.0,
+            "risk_per_trade_pct": 1.0,
+        },
+        slippage=SlippageModel(fixed_bps=0.0),
+        commission=CommissionModel(),
+        initial_capital=1000.0,
+        ensemble=_SequencedEnsemble(
+            [
+                _prediction("long", "trending_up"),
+                _prediction("no_trade", "low_volatility"),
+            ]
+        ),
+    )
+
+    results = simulator.run({"AAPL": bars})
+
+    assert results["total_trades"] == 1
+    assert simulator._positions == []
+    assert simulator._closed_trades[0].exit_time == bars[-1]["timestamp"]
+    assert results["final_equity"] == pytest.approx(1000.0 + results["total_pnl"], abs=1e-6)

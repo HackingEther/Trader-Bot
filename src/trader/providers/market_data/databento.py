@@ -108,6 +108,7 @@ class DatabentoProvider(MarketDataProvider):
         except asyncio.CancelledError:
             return
         except Exception as e:
+            self._connected = False
             logger.error("databento_receive_error", error=str(e))
             for cb in self._error_callbacks:
                 await cb(e)
@@ -189,19 +190,24 @@ class DatabentoProvider(MarketDataProvider):
         logger.info("databento_unsubscribe", symbols=symbols)
 
     def on_bar(self, callback: OnBarCallback) -> None:
-        self._bar_callbacks.append(callback)
+        if callback not in self._bar_callbacks:
+            self._bar_callbacks.append(callback)
 
     def on_quote(self, callback: OnQuoteCallback) -> None:
-        self._quote_callbacks.append(callback)
+        if callback not in self._quote_callbacks:
+            self._quote_callbacks.append(callback)
 
     def on_trade(self, callback: OnTradeCallback) -> None:
-        self._trade_callbacks.append(callback)
+        if callback not in self._trade_callbacks:
+            self._trade_callbacks.append(callback)
 
     def on_session(self, callback: OnSessionCallback) -> None:
-        self._session_callbacks.append(callback)
+        if callback not in self._session_callbacks:
+            self._session_callbacks.append(callback)
 
     def on_error(self, callback: OnErrorCallback) -> None:
-        self._error_callbacks.append(callback)
+        if callback not in self._error_callbacks:
+            self._error_callbacks.append(callback)
 
     async def is_connected(self) -> bool:
         return self._connected

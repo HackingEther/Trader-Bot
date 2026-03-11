@@ -10,9 +10,30 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from trader.core.enums import OrderStatus
 from trader.db.models.order import Order
 from trader.db.models.fill import Fill
+from trader.db.repositories.fills import FillRepository
 from trader.db.repositories.orders import OrderRepository
 
 logger = structlog.get_logger(__name__)
+
+_STATUS_RANK = {
+    OrderStatus.PENDING: 0,
+    OrderStatus.SUBMITTED: 1,
+    OrderStatus.ACCEPTED: 2,
+    OrderStatus.PARTIALLY_FILLED: 3,
+    OrderStatus.FILLED: 4,
+    OrderStatus.CANCELLED: 5,
+    OrderStatus.REJECTED: 5,
+    OrderStatus.EXPIRED: 5,
+    OrderStatus.FAILED: 5,
+}
+
+_TERMINAL_STATUSES = {
+    OrderStatus.FILLED,
+    OrderStatus.CANCELLED,
+    OrderStatus.REJECTED,
+    OrderStatus.EXPIRED,
+    OrderStatus.FAILED,
+}
 
 
 class OrderLifecycleTracker:
@@ -21,6 +42,7 @@ class OrderLifecycleTracker:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
         self._repo = OrderRepository(session)
+        self._fills = FillRepository(session)
 
     async def update_status(
         self,
@@ -32,8 +54,21 @@ class OrderLifecycleTracker:
         error_message: str | None = None,
     ) -> Order | None:
         """Update order status and related fields."""
-        updates: dict = {"status": new_status}
+        updates: dict = {}
         now = datetime.now(timezone.utc)
+        existing = await self._repo.get_by_id(order_id)
+        resolved_status = new_status
+
+        if existing is not None and existing.status in _TERMINAL_STATUSES:
+            existing_rank = _STATUS_RANK.get(existing.status, -1)
+            next_rank = _STATUS_RANK.get(new_status, -1)
+            if next_rank < existing_rank or (
+                existing.status != OrderStatus.PARTIALLY_FILLED and existing.status != new_status
+            ):
+                resolved_status = existing.status
+
+        if existing is None or resolved_status != existing.status:
+            updates["status"] = resolved_status
 
         if broker_order_id:
             updates["broker_order_id"] = broker_order_id
@@ -45,20 +80,28 @@ class OrderLifecycleTracker:
         if error_message:
             updates["error_message"] = error_message
 
-        if new_status in (OrderStatus.SUBMITTED, OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED):
+        if (
+            resolved_status in (OrderStatus.SUBMITTED, OrderStatus.ACCEPTED, OrderStatus.PARTIALLY_FILLED)
+            and existing is not None
+            and existing.submitted_at is None
+        ):
             updates["submitted_at"] = now
-        elif new_status == OrderStatus.FILLED:
-            updates["submitted_at"] = updates.get("submitted_at", now)
+        elif resolved_status == OrderStatus.FILLED:
+            if existing is not None and existing.submitted_at is None:
+                updates["submitted_at"] = now
             updates["filled_at"] = now
-        elif new_status == OrderStatus.CANCELLED:
+        elif resolved_status == OrderStatus.CANCELLED:
             updates["cancelled_at"] = now
+
+        if not updates:
+            return existing
 
         order = await self._repo.update_by_id(order_id, **updates)
         if order:
             logger.info(
                 "order_status_updated",
                 order_id=order_id,
-                new_status=new_status,
+                new_status=resolved_status,
                 broker_order_id=broker_order_id,
             )
         return order
@@ -72,19 +115,28 @@ class OrderLifecycleTracker:
         qty: int,
         price: float,
         commission: float = 0.0,
+        timestamp: datetime | None = None,
+        execution_key: str | None = None,
+        broker_execution_timestamp: datetime | None = None,
         raw: dict | None = None,
     ) -> Fill:
         """Record a fill event for an order."""
         from decimal import Decimal
+        if execution_key is not None:
+            existing = await self._fills.get_by_execution_key(execution_key)
+            if existing is not None:
+                return existing
         fill = Fill(
             order_id=order_id,
+            execution_key=execution_key,
             broker_order_id=broker_order_id,
+            broker_execution_timestamp=broker_execution_timestamp,
             symbol=symbol,
             side=side,
             qty=qty,
             price=Decimal(str(price)),
             commission=Decimal(str(commission)),
-            timestamp=datetime.now(timezone.utc),
+            timestamp=timestamp or datetime.now(timezone.utc),
             raw=raw or {},
         )
         self._session.add(fill)

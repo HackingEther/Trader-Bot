@@ -5,10 +5,10 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import DateTime, String, Text
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from trader.db.base import Base
+from trader.db.types import JSONVariant
 
 
 class SystemEvent(Base):
@@ -20,7 +20,7 @@ class SystemEvent(Base):
     source: Mapped[str] = mapped_column(String(100), nullable=False)
     event_type: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
     message: Mapped[str] = mapped_column(Text, nullable=False)
-    details: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    details: Mapped[dict] = mapped_column(JSONVariant, nullable=False, default=dict)
 
     def __repr__(self) -> str:
         return f"<SystemEvent({self.level} {self.event_type})>"

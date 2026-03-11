@@ -12,7 +12,7 @@ from trader.core.events import BarEvent
 from trader.features.engine import FeatureEngine
 from trader.models.ensemble import EnsemblePipeline
 from trader.risk.engine import RiskContext, RiskEngine
-from trader.strategy.engine import StrategyEngine
+from trader.strategy.engine import StrategyEngine, TradeIntentParams
 from trader.strategy.sizing import PositionSizer
 from trader.strategy.universe import SymbolUniverse
 
@@ -150,7 +150,9 @@ class BacktestSimulator:
         self._closed_trades: list[SimulatedPosition] = []
         self._equity_curve: list[float] = [initial_capital]
         self._latest_prices: dict[str, Decimal] = {}
+        self._latest_timestamps: dict[str, datetime] = {}
         self._cash = initial_capital
+        self._pending_entries: dict[str, TradeIntentParams] = {}
 
     def run(self, bars_by_symbol: dict[str, list[dict]]) -> dict:
         """Run backtest simulation on historical bars."""
@@ -159,13 +161,37 @@ class BacktestSimulator:
         self._closed_trades = []
         self._equity_curve = [self._initial_capital]
         self._latest_prices = {}
+        self._latest_timestamps = {}
         self._cash = self._initial_capital
+        self._pending_entries = {}
 
         all_bars = self._normalize_bars(bars_by_symbol)
 
         for symbol, bar in all_bars:
             ts = bar.timestamp
             self._latest_prices[symbol] = bar.close
+            self._latest_timestamps[symbol] = ts
+
+            pending_entry = self._pending_entries.pop(symbol, None)
+            if pending_entry is not None:
+                fill_price = self._slippage.apply(bar.open, pending_entry.side, pending_entry.qty)
+                entry_commission = float(self._commission.calculate(pending_entry.qty))
+                pos = SimulatedPosition(
+                    symbol=symbol,
+                    side=pending_entry.side,
+                    qty=pending_entry.qty,
+                    entry_price=fill_price,
+                    entry_time=ts,
+                    stop_loss=pending_entry.stop_loss,
+                    take_profit=pending_entry.take_profit,
+                    max_hold_minutes=pending_entry.max_hold_minutes,
+                    entry_commission=entry_commission,
+                )
+                self._positions.append(pos)
+                if pending_entry.side == "buy":
+                    self._cash -= float(fill_price) * pending_entry.qty + entry_commission
+                else:
+                    self._cash += float(fill_price) * pending_entry.qty - entry_commission
 
             open_for_symbol = [p for p in self._positions if p.symbol == symbol]
             for pos in open_for_symbol:
@@ -213,28 +239,12 @@ class BacktestSimulator:
                 decision = self._risk.evaluate(intent, context)
 
                 if decision.approved:
-                    reference_price = intent.limit_price or bar.close
-                    fill_price = self._slippage.apply(reference_price, intent.side, intent.qty)
-                    entry_commission = float(self._commission.calculate(intent.qty))
-                    pos = SimulatedPosition(
-                        symbol=symbol,
-                        side=intent.side,
-                        qty=intent.qty,
-                        entry_price=fill_price,
-                        entry_time=ts,
-                        stop_loss=intent.stop_loss,
-                        take_profit=intent.take_profit,
-                        max_hold_minutes=intent.max_hold_minutes,
-                        entry_commission=entry_commission,
-                    )
-                    self._positions.append(pos)
-                    if intent.side == "buy":
-                        self._cash -= float(fill_price) * intent.qty + entry_commission
-                    else:
-                        self._cash += float(fill_price) * intent.qty - entry_commission
+                    self._pending_entries[symbol] = intent
 
             self._equity_curve.append(self._mark_to_market_equity())
 
+        self._force_close_open_positions()
+        self._equity_curve.append(self._mark_to_market_equity())
         return self.get_results()
 
     def get_results(self) -> dict:
@@ -322,3 +332,15 @@ class BacktestSimulator:
                 continue
             break
         return losses
+
+    def _force_close_open_positions(self) -> None:
+        for position in list(self._positions):
+            exit_price = self._latest_prices.get(position.symbol, position.entry_price)
+            exit_time = self._latest_timestamps.get(position.symbol, position.entry_time)
+            position.close(exit_price=exit_price, exit_time=exit_time, exit_commission=0.0)
+            if position.side == "buy":
+                self._cash += float(exit_price) * position.qty
+            else:
+                self._cash -= float(exit_price) * position.qty
+            self._positions.remove(position)
+            self._closed_trades.append(position)

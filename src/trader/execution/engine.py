@@ -56,21 +56,11 @@ class ExecutionEngine:
             trade_intent_id=trade_intent_id,
         )
 
-        existing = await self._repo.get_by_idempotency_key(idem_key)
-        if existing:
-            logger.warning(
-                "duplicate_order_blocked",
-                idempotency_key=idem_key,
-                existing_order_id=existing.id,
-                symbol=intent.symbol,
-            )
-            raise DuplicateOrderError(f"Order already exists with key {idem_key}")
-
         order_class = "simple"
         if intent.stop_loss and intent.take_profit:
             order_class = "bracket"
 
-        order = await self._repo.create(
+        order, created = await self._repo.create_idempotent(
             idempotency_key=idem_key,
             trade_intent_id=trade_intent_id,
             symbol=intent.symbol,
@@ -84,6 +74,14 @@ class ExecutionEngine:
             strategy_tag=intent.strategy_tag,
             rationale=intent.rationale,
         )
+        if not created:
+            logger.warning(
+                "duplicate_order_blocked",
+                idempotency_key=idem_key,
+                existing_order_id=order.id,
+                symbol=intent.symbol,
+            )
+            raise DuplicateOrderError(f"Order already exists with key {idem_key}")
 
         try:
             broker_request = OrderRequest(
@@ -99,6 +97,7 @@ class ExecutionEngine:
             )
 
             broker_order = await self._broker.submit_order(broker_request)
+            await self._sync_child_orders(parent_order=order, broker_order=broker_order)
 
             await self._lifecycle.update_status(
                 order_id=order.id,
@@ -113,7 +112,7 @@ class ExecutionEngine:
             order.broker_metadata = broker_order.raw
 
             if broker_order.status == OrderStatus.FILLED and broker_order.filled_avg_price:
-                fill_timestamp = order.filled_at or datetime.now(timezone.utc)
+                fill_timestamp = self._fill_timestamp_from_raw(broker_order.raw) or order.filled_at or datetime.now(timezone.utc)
                 await self._lifecycle.record_fill(
                     order_id=order.id,
                     broker_order_id=broker_order.broker_order_id,
@@ -121,6 +120,10 @@ class ExecutionEngine:
                     side=intent.side,
                     qty=broker_order.filled_qty,
                     price=float(broker_order.filled_avg_price),
+                    execution_key=f"{broker_order.broker_order_id}:{broker_order.filled_qty}",
+                    broker_execution_timestamp=fill_timestamp,
+                    timestamp=fill_timestamp,
+                    raw=broker_order.raw,
                 )
                 await self._positions.apply_fill(
                     order=order,
@@ -168,3 +171,58 @@ class ExecutionEngine:
             new_status=broker_order.status,
         )
         return order
+
+    async def _sync_child_orders(self, *, parent_order: Order, broker_order) -> None:
+        for leg in broker_order.raw.get("legs", []):
+            leg_id = leg.get("alpaca_id")
+            if not leg_id:
+                continue
+            existing = await self._repo.get_by_broker_order_id(str(leg_id))
+            if existing is not None:
+                continue
+            leg_limit_price = self._to_decimal(leg.get("limit_price"))
+            leg_stop_price = self._to_decimal(leg.get("stop_price"))
+            child_side = str(leg.get("side") or ("sell" if parent_order.side == "buy" else "buy"))
+            child_qty = int(leg.get("qty") or parent_order.qty)
+            child_status = str(leg.get("status") or OrderStatus.PENDING)
+            child_type = str(leg.get("order_type") or "market")
+            child_metadata = {
+                **leg,
+                "parent_order_id": parent_order.broker_order_id,
+                "reference_price": parent_order.rationale.get("reference_price"),
+            }
+            await self._repo.create_idempotent(
+                idempotency_key=f"broker-child:{leg_id}",
+                trade_intent_id=parent_order.trade_intent_id,
+                broker_order_id=str(leg_id),
+                symbol=leg.get("symbol") or parent_order.symbol,
+                side=child_side,
+                order_type=child_type,
+                order_class="simple",
+                qty=child_qty,
+                limit_price=leg_limit_price,
+                stop_price=leg_stop_price,
+                status=child_status,
+                strategy_tag=parent_order.strategy_tag,
+                rationale=parent_order.rationale,
+                broker_metadata=child_metadata,
+            )
+
+    @staticmethod
+    def _fill_timestamp_from_raw(raw: dict) -> datetime | None:
+        timestamp_value = raw.get("filled_at") or raw.get("updated_at") or raw.get("submitted_at")
+        if not timestamp_value:
+            return None
+        try:
+            return datetime.fromisoformat(str(timestamp_value))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _to_decimal(value: object) -> Decimal | None:
+        if value in (None, ""):
+            return None
+        try:
+            return Decimal(str(value))
+        except Exception:
+            return None

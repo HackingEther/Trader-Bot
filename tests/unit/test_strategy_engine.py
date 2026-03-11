@@ -163,3 +163,43 @@ class TestStrategyEngine:
         )
         assert intent is not None
         assert intent.strategy_tag == "vwap_reversion"
+
+    def test_build_limit_price_applies_buy_and_sell_buffers(self) -> None:
+        buy_price = self.engine._build_limit_price(Decimal("100.00"), "buy", 20.0)
+        sell_price = self.engine._build_limit_price(Decimal("100.00"), "sell", 20.0)
+
+        assert buy_price == Decimal("100.15")
+        assert sell_price == Decimal("99.85")
+
+    def test_build_limit_price_returns_none_for_non_positive_price(self) -> None:
+        assert self.engine._build_limit_price(Decimal("0"), "buy", 10.0) is None
+        assert self.engine._build_limit_price(Decimal("-1"), "sell", 10.0) is None
+
+    def test_select_playbook_orb_cutoff_falls_back_after_first_hour(self) -> None:
+        playbook = self.engine._select_playbook(
+            prediction=_make_prediction(direction="long", regime="trending_up"),
+            features=_make_features(minutes_since_open=61.0),
+            spread_bps=10.0,
+        )
+
+        assert playbook is not None
+        assert playbook["name"] == "vwap_continuation"
+
+    def test_select_playbook_rejects_trend_setup_when_regime_mismatches(self) -> None:
+        playbook = self.engine._select_playbook(
+            prediction=_make_prediction(direction="long", regime="mean_reverting"),
+            features=_make_features(minutes_since_open=61.0),
+            spread_bps=10.0,
+        )
+
+        assert playbook is None
+
+    def test_select_playbook_requires_orb_volume_threshold(self) -> None:
+        playbook = self.engine._select_playbook(
+            prediction=_make_prediction(direction="long", regime="trending_up"),
+            features=_make_features(relative_volume=1.19),
+            spread_bps=10.0,
+        )
+
+        assert playbook is not None
+        assert playbook["name"] == "vwap_continuation"

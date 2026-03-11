@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 
 import structlog
 
@@ -37,13 +38,17 @@ class IngestionManager:
 
         self._staleness = StalenessDetector(threshold_seconds=staleness_threshold)
         self._reconnect = ReconnectPolicy()
-        self._bar_handler = BarHandler(self._staleness)
-        self._quote_handler = QuoteHandler(self._staleness)
-        self._trade_handler = TradeHandler(self._staleness)
         self._state_store = SystemStateStore()
+        self._bar_handler = BarHandler(self._staleness, state_store=self._state_store)
+        self._quote_handler = QuoteHandler(self._staleness, state_store=self._state_store)
+        self._trade_handler = TradeHandler(self._staleness, state_store=self._state_store)
+        self._lease_name = f"ingestion:{type(provider).__name__}:{','.join(sorted(symbols))}"
+        self._lease_owner = str(uuid.uuid4())
 
         self._running = False
         self._staleness_task: asyncio.Task | None = None  # type: ignore[type-arg]
+        self._lease_task: asyncio.Task | None = None  # type: ignore[type-arg]
+        self._callbacks_registered = False
 
     @property
     def staleness_detector(self) -> StalenessDetector:
@@ -55,7 +60,12 @@ class IngestionManager:
 
     async def start(self) -> None:
         """Start the ingestion pipeline with auto-reconnect."""
+        lease_acquired = await self._state_store.acquire_lease(self._lease_name, self._lease_owner, ttl_seconds=15)
+        if not lease_acquired:
+            logger.warning("ingestion_lock_unavailable", lease=self._lease_name)
+            return
         self._running = True
+        self._lease_task = asyncio.create_task(self._lease_keepalive())
         logger.info("ingestion_starting", symbols=self._symbols)
 
         while self._running:
@@ -89,6 +99,8 @@ class IngestionManager:
         self._running = False
         if self._staleness_task and not self._staleness_task.done():
             self._staleness_task.cancel()
+        if self._lease_task and not self._lease_task.done():
+            self._lease_task.cancel()
         try:
             await self._provider.disconnect()
         except Exception as e:
@@ -99,10 +111,12 @@ class IngestionManager:
         """Connect to provider and subscribe to data feeds."""
         await self._provider.connect()
 
-        self._provider.on_bar(self._on_bar)
-        self._provider.on_quote(self._on_quote)
-        self._provider.on_trade(self._on_trade)
-        self._provider.on_error(self._on_error)
+        if not self._callbacks_registered:
+            self._provider.on_bar(self._on_bar)
+            self._provider.on_quote(self._on_quote)
+            self._provider.on_trade(self._on_trade)
+            self._provider.on_error(self._on_error)
+            self._callbacks_registered = True
 
         await self._provider.subscribe(
             symbols=self._symbols,
@@ -152,5 +166,21 @@ class IngestionManager:
                 stale = self._staleness.check_all()
                 if stale:
                     logger.warning("ingestion_stale_symbols", symbols=stale)
+        except asyncio.CancelledError:
+            pass
+
+    async def _lease_keepalive(self) -> None:
+        try:
+            while self._running:
+                await asyncio.sleep(5.0)
+                renewed = await self._state_store.renew_lease(self._lease_name, self._lease_owner, ttl_seconds=15)
+                if not renewed:
+                    logger.warning("ingestion_lock_lost", lease=self._lease_name)
+                    self._running = False
+                    try:
+                        await self._provider.disconnect()
+                    except Exception as exc:
+                        logger.error("ingestion_disconnect_error", error=str(exc))
+                    return
         except asyncio.CancelledError:
             pass

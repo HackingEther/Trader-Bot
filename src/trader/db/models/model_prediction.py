@@ -5,10 +5,10 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import DateTime, Float, Integer, String
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from trader.db.base import Base, TimestampMixin
+from trader.db.types import JSONVariant
 
 
 class ModelPredictionRecord(Base, TimestampMixin):
@@ -24,7 +24,7 @@ class ModelPredictionRecord(Base, TimestampMixin):
     no_trade_score: Mapped[float] = mapped_column(Float, nullable=False)
     regime: Mapped[str] = mapped_column(String(30), nullable=False)
     feature_snapshot_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    model_versions_used: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    model_versions_used: Mapped[dict] = mapped_column(JSONVariant, nullable=False, default=dict)
 
     def __repr__(self) -> str:
         return f"<ModelPredictionRecord({self.symbol} {self.direction} conf={self.confidence:.2f})>"

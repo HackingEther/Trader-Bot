@@ -75,3 +75,29 @@ async def set_cached(key: str, value: str, ttl_seconds: int = 300) -> None:
     """Set a cached value with TTL."""
     client = await get_redis()
     await client.set(key, value, ex=ttl_seconds)
+
+
+async def set_cached_if_absent(key: str, value: str, ttl_seconds: int = 300) -> bool:
+    """Set a cached value only if the key does not already exist."""
+    client = await get_redis()
+    result = await client.set(key, value, ex=ttl_seconds, nx=True)
+    return bool(result)
+
+
+async def compare_and_set_cached(key: str, expected_value: str, new_value: str, ttl_seconds: int = 300) -> bool:
+    """Atomically update a cached value when the current value matches."""
+    client = await get_redis()
+    async with client.pipeline(transaction=True) as pipe:
+        while True:
+            try:
+                await pipe.watch(key)
+                current = await pipe.get(key)
+                if current != expected_value:
+                    await pipe.reset()
+                    return False
+                pipe.multi()
+                pipe.set(key, new_value, ex=ttl_seconds)
+                await pipe.execute()
+                return True
+            except aioredis.WatchError:
+                continue

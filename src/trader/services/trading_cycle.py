@@ -17,6 +17,7 @@ from trader.db.models.model_prediction import ModelPredictionRecord
 from trader.db.models.risk_decision import RiskDecisionRecord
 from trader.db.models.trade_intent import TradeIntent
 from trader.db.repositories.feature_snapshots import FeatureSnapshotRepository
+from trader.db.repositories.orders import OrderRepository
 from trader.db.repositories.market_bars import MarketBarRepository
 from trader.db.repositories.model_predictions import ModelPredictionRepository
 from trader.db.repositories.pnl_snapshots import PnlSnapshotRepository
@@ -82,6 +83,7 @@ class TradingCycleService:
         self._trade_intents = TradeIntentRepository(session)
         self._risk_decisions = RiskDecisionRepository(session)
         self._positions = PositionRepository(session)
+        self._orders = OrderRepository(session)
         self._pnl = PnlSnapshotRepository(session)
 
     async def run_cycle(self, symbols: list[str] | None = None) -> dict:
@@ -125,11 +127,26 @@ class TradingCycleService:
         selected_ids = {candidate.intent_record.id for candidate in selected}
 
         open_positions = await self._positions.get_open_positions()
-        projected_total_exposure = sum((position.market_value or Decimal("0")) for position in open_positions)
-        projected_open_count = len(open_positions)
+        open_orders = await self._orders.get_open_orders()
+        outstanding_open_order_exposure = sum(
+            self._order_notional(order)
+            for order in open_orders
+            if order.filled_qty < order.qty
+        )
+        projected_total_exposure = (
+            sum((position.market_value or Decimal("0")) for position in open_positions)
+            + outstanding_open_order_exposure
+        )
+        projected_open_count = len(open_positions) + self._open_order_slots(open_orders)
         projected_symbol_exposure = {
             position.symbol: (position.market_value or Decimal("0")) for position in open_positions
         }
+        for order in open_orders:
+            if order.filled_qty >= order.qty:
+                continue
+            projected_symbol_exposure[order.symbol] = projected_symbol_exposure.get(
+                order.symbol, Decimal("0")
+            ) + self._order_notional(order)
 
         for candidate in candidates:
             if candidate.intent_record.id not in selected_ids:
@@ -146,6 +163,28 @@ class TradingCycleService:
                 continue
 
             try:
+                resized_intent = self._apply_projected_capacity(
+                    intent=candidate.intent,
+                    price=candidate.latest_bar.close,
+                    projected_total_exposure=projected_total_exposure,
+                    projected_symbol_exposure=projected_symbol_exposure.get(
+                        candidate.symbol, Decimal("0")
+                    ),
+                )
+                if resized_intent is None:
+                    await self._trade_intents.update_by_id(candidate.intent_record.id, status="cancelled")
+                    self._record_result(
+                        results,
+                        SymbolCycleResult(
+                            symbol=candidate.symbol,
+                            status="predicted",
+                            reason="capacity_filtered",
+                            trade_intent_id=candidate.intent_record.id,
+                        ),
+                    )
+                    continue
+                candidate.intent = resized_intent
+                await self._trade_intents.update_by_id(candidate.intent_record.id, qty=resized_intent.qty)
                 outcome = await self._execute_candidate(
                     candidate,
                     projected_total_exposure=projected_total_exposure,
@@ -180,10 +219,25 @@ class TradingCycleService:
         account = await self._broker.get_account()
         open_positions = await self._positions.get_open_positions()
         all_positions = await self._positions.get_all(limit=5000)
+        broker_positions = {position.symbol: position for position in await self._broker.get_positions()}
 
         realized = sum((p.realized_pnl for p in all_positions if p.status == "closed"), Decimal("0"))
-        unrealized = account.equity - account.cash - realized
-        total_exposure = sum((p.market_value or Decimal("0")) for p in open_positions)
+        unrealized = sum(
+            (
+                broker_positions.get(position.symbol).unrealized_pnl
+                if broker_positions.get(position.symbol) is not None
+                else position.unrealized_pnl
+            )
+            for position in open_positions
+        )
+        total_exposure = sum(
+            (
+                broker_positions.get(position.symbol).market_value
+                if broker_positions.get(position.symbol) is not None
+                else (position.market_value or Decimal("0"))
+            )
+            for position in open_positions
+        )
         win_count = sum(1 for p in all_positions if p.status == "closed" and p.realized_pnl > 0)
         loss_count = sum(1 for p in all_positions if p.status == "closed" and p.realized_pnl <= 0)
         now = now_utc()
@@ -209,7 +263,7 @@ class TradingCycleService:
             "open_positions": snapshot.open_positions,
         }
 
-    async def reconcile_positions(self, auto_fix: bool = True, halt_on_discrepancy: bool = True) -> dict:
+    async def reconcile_positions(self, auto_fix: bool = False, halt_on_discrepancy: bool = True) -> dict:
         reconciler = PositionReconciler(self._broker, self._session)
         result = await reconciler.reconcile(auto_fix=auto_fix)
         material_discrepancy = bool(result.mismatched or result.broker_only or result.local_only)
@@ -278,6 +332,11 @@ class TradingCycleService:
             return SymbolCycleResult(symbol=symbol, status="predicted", reason="strategy_filtered")
 
         intent.model_prediction_id = prediction_record.id
+        intent.rationale = {
+            **intent.rationale,
+            "reference_price": str(latest_bar.close),
+            "reference_timestamp": latest_bar.timestamp.isoformat(),
+        }
         intent_record = await self._persist_trade_intent(intent, timestamp=timestamp)
         score = self._score_candidate(prediction=prediction, features=features)
         return PreparedSignal(
@@ -325,10 +384,11 @@ class TradingCycleService:
                 state_store=self._state_store,
             )
             order = await execution.execute(candidate.intent, trade_intent_id=candidate.intent_record.id)
-            await self._trade_intents.update_by_id(candidate.intent_record.id, status="executed")
+            intent_status = "executed" if order.status in {"partially_filled", "filled"} else "approved"
+            await self._trade_intents.update_by_id(candidate.intent_record.id, status=intent_status)
             return SymbolCycleResult(
                 symbol=candidate.symbol,
-                status="executed",
+                status="executed" if intent_status == "executed" else "approved",
                 trade_intent_id=candidate.intent_record.id,
                 order_id=order.id,
             )
@@ -404,6 +464,7 @@ class TradingCycleService:
 
         all_positions = await self._positions.get_all(limit=5000)
         open_positions = [position for position in all_positions if position.status == "open"]
+        open_orders = await self._orders.get_open_orders()
         last_bar_time = await self._state_store.get_last_bar_timestamp(intent.symbol)
         spread_bps = intent.rationale.get("spread_bps")
         if spread_bps is None:
@@ -428,7 +489,8 @@ class TradingCycleService:
             daily_realized_pnl=self._daily_realized_pnl(all_positions),
             current_exposure=projected_total_exposure
             if projected_total_exposure is not None
-            else sum((p.market_value or Decimal("0")) for p in open_positions),
+            else sum((p.market_value or Decimal("0")) for p in open_positions)
+            + sum(self._order_notional(order) for order in open_orders if order.filled_qty < order.qty),
             symbol_exposure=projected_symbol_exposure
             if projected_symbol_exposure is not None
             else sum(
@@ -436,7 +498,9 @@ class TradingCycleService:
                 for position in open_positions
                 if position.symbol == intent.symbol
             ),
-            open_position_count=projected_open_count if projected_open_count is not None else len(open_positions),
+            open_position_count=projected_open_count
+            if projected_open_count is not None
+            else len(open_positions) + self._open_order_slots(open_orders),
             consecutive_losses=self._count_consecutive_losses(all_positions),
             spread_bps=float(spread_bps),
             last_data_time=last_bar_time,
@@ -519,6 +583,79 @@ class TradingCycleService:
             results["orders_submitted"] += 1
         if outcome.status == "rejected":
             results["orders_rejected"] += 1
+
+    def _apply_projected_capacity(
+        self,
+        *,
+        intent: TradeIntentParams,
+        price: Decimal,
+        projected_total_exposure: Decimal,
+        projected_symbol_exposure: Decimal,
+    ) -> TradeIntentParams | None:
+        if price <= 0:
+            return None
+        total_remaining = max(
+            Decimal("0"),
+            Decimal(str(self._settings.max_notional_exposure_usd)) - projected_total_exposure,
+        )
+        symbol_remaining = max(
+            Decimal("0"),
+            Decimal(str(self._settings.max_exposure_per_symbol_usd)) - projected_symbol_exposure,
+        )
+        max_affordable_qty = int(min(total_remaining, symbol_remaining) / price)
+        resized_qty = min(intent.qty, max_affordable_qty)
+        if resized_qty <= 0:
+            return None
+        if resized_qty == intent.qty:
+            return intent
+
+        resized_rationale = {**intent.rationale, "resized_from_qty": intent.qty, "resized_to_qty": resized_qty}
+        return TradeIntentParams(
+            symbol=intent.symbol,
+            side=intent.side,
+            qty=resized_qty,
+            entry_order_type=intent.entry_order_type,
+            limit_price=intent.limit_price,
+            stop_loss=intent.stop_loss,
+            take_profit=intent.take_profit,
+            max_hold_minutes=intent.max_hold_minutes,
+            strategy_tag=intent.strategy_tag,
+            model_prediction_id=intent.model_prediction_id,
+            confidence=intent.confidence,
+            expected_move_bps=intent.expected_move_bps,
+            rationale=resized_rationale,
+        )
+
+    @staticmethod
+    def _order_notional(order) -> Decimal:
+        remaining_qty = max(0, int(order.qty) - int(order.filled_qty))
+        if remaining_qty <= 0:
+            return Decimal("0")
+        rationale = getattr(order, "rationale", {}) or {}
+        broker_metadata = getattr(order, "broker_metadata", {}) or {}
+        raw_price = (
+            order.limit_price
+            or order.filled_avg_price
+            or TradingCycleService._safe_decimal(rationale.get("reference_price"))
+            or TradingCycleService._safe_decimal(broker_metadata.get("reference_price"))
+            or Decimal("0")
+        )
+        reference_price = raw_price
+        return reference_price * remaining_qty
+
+    @staticmethod
+    def _open_order_slots(open_orders: list) -> int:
+        symbols = {order.symbol for order in open_orders if order.filled_qty < order.qty}
+        return len(symbols)
+
+    @staticmethod
+    def _safe_decimal(value: object) -> Decimal | None:
+        if value in (None, ""):
+            return None
+        try:
+            return Decimal(str(value))
+        except Exception:
+            return None
 
     @staticmethod
     def _bar_to_dict(bar) -> dict:

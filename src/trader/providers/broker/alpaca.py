@@ -36,9 +36,34 @@ _TIF_MAP = {
 }
 
 
+def _maybe_iso(value: object) -> str | None:
+    return value.isoformat() if value is not None and hasattr(value, "isoformat") else None
+
+
+def _serialize_order_entity(raw_order: object, *, include_legs: bool = True) -> dict:
+    o = raw_order  # type: ignore[assignment]
+    raw: dict = {
+        "alpaca_id": str(o.id),
+        "client_order_id": getattr(o, "client_order_id", None),
+        "parent_order_id": str(getattr(o, "parent_order_id", "")) if getattr(o, "parent_order_id", None) else None,
+        "submitted_at": _maybe_iso(getattr(o, "submitted_at", None)),
+        "updated_at": _maybe_iso(getattr(o, "updated_at", None)),
+        "filled_at": _maybe_iso(getattr(o, "filled_at", None)),
+        "canceled_at": _maybe_iso(getattr(o, "canceled_at", None)),
+        "replaced_at": _maybe_iso(getattr(o, "replaced_at", None)),
+    }
+    if include_legs:
+        raw["legs"] = [
+            _serialize_order_entity(leg, include_legs=False)
+            for leg in list(getattr(o, "legs", []) or [])
+        ]
+    return raw
+
+
 def _to_broker_order(raw_order: object) -> BrokerOrder:
     """Convert Alpaca order object to standardized BrokerOrder."""
     o = raw_order  # type: ignore[assignment]
+    raw = _serialize_order_entity(o)
     return BrokerOrder(
         broker_order_id=str(o.id),
         symbol=o.symbol,
@@ -52,7 +77,7 @@ def _to_broker_order(raw_order: object) -> BrokerOrder:
         status=str(o.status.value) if o.status else "unknown",
         order_class=str(o.order_class.value) if o.order_class else "simple",
         time_in_force=str(o.time_in_force.value) if o.time_in_force else "day",
-        raw={"alpaca_id": str(o.id), "client_order_id": o.client_order_id},
+        raw=raw,
     )
 
 

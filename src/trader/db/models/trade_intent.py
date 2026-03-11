@@ -6,10 +6,10 @@ from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import DateTime, Float, Index, Integer, Numeric, String
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from trader.db.base import Base, TimestampMixin
+from trader.db.types import JSONVariant
 
 
 class TradeIntent(Base, TimestampMixin):
@@ -29,7 +29,7 @@ class TradeIntent(Base, TimestampMixin):
     model_prediction_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     expected_move_bps: Mapped[float | None] = mapped_column(Float, nullable=True)
-    rationale: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    rationale: Mapped[dict] = mapped_column(JSONVariant, nullable=False, default=dict)
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     __table_args__ = (
