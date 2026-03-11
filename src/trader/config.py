@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Annotated
 
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -71,7 +72,7 @@ class Settings(BaseSettings):
     spread_threshold_bps: float = Field(default=50.0)
 
     # ── Strategy ──
-    symbol_universe: list[str] = Field(
+    symbol_universe: Annotated[list[str], NoDecode] = Field(
         default=["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "SPY", "QQQ", "AMD"]
     )
     min_confidence: float = Field(default=0.6)
