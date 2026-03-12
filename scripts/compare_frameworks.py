@@ -28,6 +28,17 @@ from trader.models.training.pipeline import TrainingPipeline
 from trader.services.historical_data import HistoricalDataService
 
 
+HEARTBEAT_INTERVAL_SEC = 300  # 5 minutes
+
+
+async def _heartbeat() -> None:
+    """Print a status line every 5 minutes to show the script is still running."""
+    while True:
+        await asyncio.sleep(HEARTBEAT_INTERVAL_SEC)
+        ts = datetime.now(UTC).strftime("%H:%M:%S UTC")
+        print(f"  ✓ Still running... ({ts})", flush=True)
+
+
 def _parse_dt(value: str) -> datetime:
     dt = datetime.fromisoformat(value)
     if dt.tzinfo is None:
@@ -183,37 +194,45 @@ async def main() -> None:
             ("tradable_walkforward", "tradable", "walkforward"),
         ]
 
-        for config_name, labels, validation_mode in configs:
-            train_m, bt_m, fold_m, agg = await _run_config(
-                session=session,
-                labels=labels,
-                validation_mode=validation_mode,
-                train_bars=train_bars,
-                test_bars=test_bars,
-                symbols=symbols,
-                train_start=train_start,
-                train_end=train_end,
-                test_start=test_start,
-                test_end=test_end,
-                lookahead_bars=args.lookahead_bars,
-                n_folds=args.n_folds,
-                purge_bars=args.purge_bars,
-                embargo_bars=args.embargo_bars,
-                train_regime_legacy=args.train_regime_legacy,
-            )
-            await session.commit()
-
-            reports.append(
-                ComparisonReport(
-                    config_name=config_name,
+        heartbeat_task = asyncio.create_task(_heartbeat())
+        try:
+            for config_name, labels, validation_mode in configs:
+                train_m, bt_m, fold_m, agg = await _run_config(
+                    session=session,
                     labels=labels,
                     validation_mode=validation_mode,
-                    training_metrics=train_m,
-                    backtest_metrics=bt_m,
-                    fold_metrics=fold_m,
-                    aggregate=agg,
+                    train_bars=train_bars,
+                    test_bars=test_bars,
+                    symbols=symbols,
+                    train_start=train_start,
+                    train_end=train_end,
+                    test_start=test_start,
+                    test_end=test_end,
+                    lookahead_bars=args.lookahead_bars,
+                    n_folds=args.n_folds,
+                    purge_bars=args.purge_bars,
+                    embargo_bars=args.embargo_bars,
+                    train_regime_legacy=args.train_regime_legacy,
                 )
-            )
+                await session.commit()
+
+                reports.append(
+                    ComparisonReport(
+                        config_name=config_name,
+                        labels=labels,
+                        validation_mode=validation_mode,
+                        training_metrics=train_m,
+                        backtest_metrics=bt_m,
+                        fold_metrics=fold_m,
+                        aggregate=agg,
+                    )
+                )
+        finally:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
 
     await engine.dispose()
 
