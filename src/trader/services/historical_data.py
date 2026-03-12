@@ -17,6 +17,9 @@ from trader.db.repositories.market_bars import MarketBarRepository
 
 logger = structlog.get_logger(__name__)
 
+# PostgreSQL limit ~32,767 params; each row ~9 cols → max ~3,600 rows. Use 2000 to be safe.
+INSERT_BATCH_SIZE = 2000
+
 
 class HistoricalDataService:
     """Load and backfill historical bars for research and backtests."""
@@ -115,11 +118,13 @@ class HistoricalDataService:
                             from sqlalchemy.dialects.postgresql import insert as dialect_insert
                         else:
                             from sqlalchemy.dialects.sqlite import insert as dialect_insert
-                        stmt = dialect_insert(MarketBar).values(batch_values).on_conflict_do_nothing(
-                            index_elements=["symbol", "interval", "timestamp"]
-                        )
-                        await self._session.execute(stmt)
-                        inserted += len(batch_values)
+                        for i in range(0, len(batch_values), INSERT_BATCH_SIZE):
+                            chunk = batch_values[i : i + INSERT_BATCH_SIZE]
+                            stmt = dialect_insert(MarketBar).values(chunk).on_conflict_do_nothing(
+                                index_elements=["symbol", "interval", "timestamp"]
+                            )
+                            await self._session.execute(stmt)
+                            inserted += len(chunk)
                     else:
                         for values in batch_values:
                             try:
