@@ -313,3 +313,33 @@ def test_backtest_spread_bps_passed_to_strategy_and_risk() -> None:
     results = simulator.run({"AAPL": bars})
 
     assert results["total_trades"] == 0
+
+
+def test_backtest_decision_funnel_in_results_when_funnel_audit() -> None:
+    """When funnel_audit=True, results include decision_funnel."""
+    bars = _bars(100.0, [0.2] * 20)
+    simulator = BacktestSimulator(
+        symbols=["AAPL"],
+        strategy_config={
+            "min_history_bars": 16,
+            "min_confidence": 0.0,
+            "min_expected_move_bps": 0.0,
+            "min_relative_volume": 0.0,
+            "max_position_value": 101.0,
+            "risk_per_trade_pct": 1.0,
+            "funnel_audit": True,
+            "framework": "test_fw",
+        },
+        slippage=SlippageModel(fixed_bps=0.0),
+        commission=CommissionModel(),
+        initial_capital=1000.0,
+        ensemble=_SequencedEnsemble([_prediction("long", "trending_up")]),
+    )
+
+    results = simulator.run({"AAPL": bars})
+
+    assert "decision_funnel" in results
+    funnel = results["decision_funnel"]
+    assert "total_by_reason" in funnel
+    assert "by_framework_symbol_side" in funnel
+    assert "event_count" in funnel

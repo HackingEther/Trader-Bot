@@ -323,6 +323,8 @@ class TradingCycleService:
             limit_entry_buffer_bps=self._settings.limit_entry_buffer_bps,
             use_marketable_limits=getattr(self._settings, "use_marketable_limits", True),
             marketable_limit_buffer_bps=getattr(self._settings, "marketable_limit_buffer_bps", 5.0),
+            no_trade_score_hard_veto=getattr(self._settings, "no_trade_score_hard_veto", 0.85),
+            min_playbook_fit=getattr(self._settings, "min_playbook_fit", 0.4),
         )
 
         has_broker_position = await self._broker.get_position(symbol) is not None
@@ -374,7 +376,7 @@ class TradingCycleService:
             )
             decision_snapshot_id = snapshot.id
             intent.rationale["decision_quote_snapshot_id"] = decision_snapshot_id
-        score = self._score_candidate(prediction=prediction, features=features)
+        score = self._score_candidate(prediction=prediction, features=features, intent=intent)
         return PreparedSignal(
             symbol=symbol,
             latest_bar=latest_bar,
@@ -580,7 +582,20 @@ class TradingCycleService:
                 realized += position.realized_pnl
         return realized
 
-    def _score_candidate(self, *, prediction: ModelPrediction, features: dict[str, float]) -> float:
+    def _filter_penalty(self, no_trade_score: float) -> float:
+        """Penalty factor for no_trade_score: soft penalty when in (soft_max, hard_veto)."""
+        soft_max = getattr(self._settings, "no_trade_score_soft_max", 0.5)
+        if no_trade_score <= soft_max:
+            return 1.0
+        return max(0.01, (1.0 - no_trade_score) ** 2)
+
+    def _score_candidate(
+        self,
+        *,
+        prediction: ModelPrediction,
+        features: dict[str, float],
+        intent: TradeIntentParams | None = None,
+    ) -> float:
         relative_volume = max(0.1, float(features.get("relative_volume", 1.0)))
         spread_bps = max(0.0, float(features.get("spread_bps", 0.0)))
         momentum_bonus = abs(float(features.get("momentum_5m", 0.0))) + abs(
@@ -594,10 +609,15 @@ class TradingCycleService:
             "low_volatility": 0.95,
         }.get(prediction.regime, 1.0)
         spread_penalty = 1.0 / (1.0 + spread_bps / 10.0)
+        filter_penalty = self._filter_penalty(prediction.no_trade_score)
+        playbook_fit = 1.0
+        if intent and intent.rationale:
+            playbook_fit = float(intent.rationale.get("playbook_fit", 1.0))
         return (
             prediction.confidence
             * prediction.expected_move_bps
-            * max(0.1, 1.0 - prediction.no_trade_score)
+            * filter_penalty
+            * playbook_fit
             * regime_multiplier
             * max(0.5, relative_volume)
             * max(1.0, momentum_bonus * 100.0)

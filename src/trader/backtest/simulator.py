@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -13,6 +14,7 @@ from trader.features.engine import FeatureEngine
 from trader.models.ensemble import EnsemblePipeline
 from trader.risk.engine import RiskContext, RiskEngine
 from trader.strategy.engine import StrategyEngine, TradeIntentParams
+from trader.strategy.funnel import DecisionFunnelTracker
 from trader.strategy.sizing import PositionSizer
 from trader.strategy.universe import SymbolUniverse
 
@@ -129,6 +131,11 @@ class BacktestSimulator:
             risk_per_trade_pct=sc.get("risk_per_trade_pct", 0.01),
         )
         self._track_block_reasons = sc.get("track_block_reasons", False)
+        self._funnel_audit = sc.get("funnel_audit", False)
+        self._framework = sc.get("framework", "default")
+        self._funnel_tracker: DecisionFunnelTracker | None = None
+        if self._track_block_reasons or self._funnel_audit:
+            self._funnel_tracker = DecisionFunnelTracker(framework=self._framework)
         self._strategy = StrategyEngine(
             universe=self._universe,
             sizer=self._sizer,
@@ -137,7 +144,10 @@ class BacktestSimulator:
             min_relative_volume=sc.get("min_relative_volume", 0.0),
             max_spread_bps=sc.get("max_spread_bps"),
             max_no_trade_score=sc.get("max_no_trade_score", 0.5),
+            no_trade_score_hard_veto=sc.get("no_trade_score_hard_veto", 0.85),
+            min_playbook_fit=sc.get("min_playbook_fit", 0.4),
             track_block_reasons=self._track_block_reasons,
+            funnel_tracker=self._funnel_tracker,
         )
         self._risk = RiskEngine(
             max_daily_loss=rc.get("max_daily_loss", 1000.0),
@@ -177,8 +187,11 @@ class BacktestSimulator:
         self._risk_rejected_count = 0
         if self._track_block_reasons:
             self._strategy.reset_block_stats()
+        if self._funnel_tracker is not None:
+            self._funnel_tracker.reset()
 
         all_bars = self._normalize_bars(bars_by_symbol)
+        benchmark_symbols = [s for s in ("SPY", "QQQ") if s in bars_by_symbol]
 
         # Entry timing: signal on bar N uses bar N's data; fill is at bar N+1's open.
         # We never fill on the same bar as the decision (avoids same-bar optimism).
@@ -231,8 +244,16 @@ class BacktestSimulator:
                 continue
 
             has_position = any(p.symbol == symbol for p in self._positions)
+            benchmark_returns = (
+                self._benchmark_returns_at(bars_by_symbol, ts, benchmark_symbols)
+                if benchmark_symbols
+                else None
+            )
             features = self._feature_engine.compute_features(
-                symbol, ts, spread_bps=self._spread_bps_override
+                symbol,
+                ts,
+                spread_bps=self._spread_bps_override,
+                benchmark_returns=benchmark_returns,
             )
             prediction = self._ensemble.predict(symbol, features, ts)
 
@@ -264,8 +285,18 @@ class BacktestSimulator:
 
                 if decision.approved:
                     self._pending_entries[symbol] = intent
-                elif self._track_block_reasons:
-                    self._risk_rejected_count += 1
+                else:
+                    if self._track_block_reasons:
+                        self._risk_rejected_count += 1
+                    if self._funnel_tracker is not None:
+                        failed_rule = decision.first_failed_rule()
+                        if failed_rule:
+                            side_for_funnel = "long" if intent.side == "buy" else "short"
+                            self._funnel_tracker.record(
+                                symbol=symbol,
+                                side=side_for_funnel,
+                                block_reason=f"risk_{failed_rule}",
+                            )
 
             self._equity_curve.append(self._mark_to_market_equity())
 
@@ -326,7 +357,34 @@ class BacktestSimulator:
         if self._track_block_reasons:
             result["strategy_block_reasons"] = self._strategy.get_block_stats()
             result["risk_rejected_count"] = self._risk_rejected_count
+        if self._funnel_tracker is not None:
+            result["decision_funnel"] = self._funnel_tracker.get_summary()
         return result
+
+    def _benchmark_returns_at(
+        self,
+        bars_by_symbol: dict[str, list],
+        timestamp: datetime,
+        benchmarks: list[str],
+    ) -> dict[str, float] | None:
+        """Compute 5-bar return for each benchmark at timestamp. Returns None if insufficient data."""
+        out: dict[str, float] = {}
+        for sym in benchmarks:
+            bars = [
+                b for b in bars_by_symbol.get(sym, [])
+                if (b.timestamp if hasattr(b, "timestamp") else b["timestamp"]) <= timestamp
+            ]
+            bars = bars[-6:]  # need 6 bars for 5-period return
+            if len(bars) >= 6:
+                c0 = float(bars[-6].close if hasattr(bars[-6], "close") else bars[-6]["close"])
+                c1 = float(bars[-1].close if hasattr(bars[-1], "close") else bars[-1]["close"])
+                if c0 and c0 > 0:
+                    out[sym] = math.log(c1 / c0)
+                else:
+                    out[sym] = 0.0
+            else:
+                out[sym] = 0.0
+        return out if out else None
 
     def _normalize_bars(self, bars_by_symbol: dict[str, list[dict]]) -> list[tuple[str, BarEvent]]:
         normalized: list[tuple[str, BarEvent]] = []

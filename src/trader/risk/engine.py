@@ -55,6 +55,13 @@ class RiskDecision:
         self.rule_results = rule_results
         self.timestamp = datetime.now(timezone.utc)
 
+    def first_failed_rule(self) -> str | None:
+        """Return the first rule name that failed, for funnel tracking."""
+        for name, passed in self.rule_results.items():
+            if not passed:
+                return name
+        return None
+
 
 class RiskEngine:
     """Evaluates trade intents against configurable risk rules.

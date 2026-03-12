@@ -275,6 +275,52 @@ def test_open_order_slots_counts_unique_symbols() -> None:
     assert slots == 2
 
 
+def test_composite_score_includes_playbook_fit() -> None:
+    """_score_candidate uses playbook_fit from intent.rationale."""
+    from trader.config import get_settings
+    from trader.core.events import ModelPrediction
+
+    service = TradingCycleService.__new__(TradingCycleService)
+    service._settings = get_settings()
+
+    pred = ModelPrediction(
+        symbol="AAPL",
+        timestamp=datetime.now(timezone.utc),
+        direction="long",
+        confidence=0.8,
+        expected_move_bps=25.0,
+        expected_holding_minutes=30.0,
+        no_trade_score=0.2,
+        regime="trending_up",
+    )
+    features = {
+        "relative_volume": 1.2,
+        "spread_bps": 10.0,
+        "momentum_5m": 0.01,
+        "momentum_15m": 0.02,
+    }
+
+    intent_full = TradeIntentParams(
+        symbol="AAPL",
+        side="buy",
+        qty=10,
+        rationale={"playbook_fit": 1.0},
+    )
+    intent_half = TradeIntentParams(
+        symbol="AAPL",
+        side="buy",
+        qty=10,
+        rationale={"playbook_fit": 0.5},
+    )
+
+    score_full = service._score_candidate(prediction=pred, features=features, intent=intent_full)
+    score_half = service._score_candidate(prediction=pred, features=features, intent=intent_half)
+
+    assert score_full > 0
+    assert score_half > 0
+    assert score_half < score_full
+
+
 def test_ranking_selects_highest_scores_first() -> None:
     """Selected candidates are in score-descending order; processing follows that order."""
     candidates = [

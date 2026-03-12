@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from typing import TYPE_CHECKING
 
 import structlog
 
 from trader.core.events import ModelPrediction
 from trader.strategy.sizing import PositionSizer
 from trader.strategy.universe import SymbolUniverse
+
+if TYPE_CHECKING:
+    from trader.strategy.funnel import DecisionFunnelTracker
 
 logger = structlog.get_logger(__name__)
 
@@ -60,10 +64,13 @@ class StrategyEngine:
         max_spread_bps: float | None = None,
         limit_entry_buffer_bps: float = 5.0,
         max_no_trade_score: float = 0.5,
+        no_trade_score_hard_veto: float = 0.85,
+        min_playbook_fit: float = 0.4,
         default_max_hold_minutes: int = 60,
         track_block_reasons: bool = False,
         use_marketable_limits: bool = True,
         marketable_limit_buffer_bps: float = 5.0,
+        funnel_tracker: DecisionFunnelTracker | None = None,
     ) -> None:
         self._universe = universe
         self._sizer = sizer
@@ -75,13 +82,36 @@ class StrategyEngine:
         self._use_marketable_limits = use_marketable_limits
         self._marketable_limit_buffer_bps = marketable_limit_buffer_bps
         self._max_no_trade_score = max_no_trade_score
+        self._no_trade_score_hard_veto = no_trade_score_hard_veto
+        self._min_playbook_fit = min_playbook_fit
         self._default_max_hold = default_max_hold_minutes
         self._track_block_reasons = track_block_reasons
+        self._funnel_tracker = funnel_tracker
         self._block_counts: dict[str, int] = {}
 
-    def _record_block(self, reason: str) -> None:
+    def _record_block(
+        self,
+        reason: str,
+        *,
+        symbol: str = "",
+        side: str = "",
+        prediction: ModelPrediction | None = None,
+        playbook_candidate: str | None = None,
+        best_playbook_fit: float | None = None,
+    ) -> None:
         if self._track_block_reasons:
             self._block_counts[reason] = self._block_counts.get(reason, 0) + 1
+        if self._funnel_tracker and symbol and side:
+            self._funnel_tracker.record(
+                symbol=symbol,
+                side=side,
+                block_reason=reason,
+                playbook_candidate=playbook_candidate,
+                confidence=prediction.confidence if prediction else None,
+                expected_move_bps=prediction.expected_move_bps if prediction else None,
+                no_trade_score=prediction.no_trade_score if prediction else None,
+                best_playbook_fit=best_playbook_fit,
+            )
 
     def get_block_stats(self) -> dict[str, int]:
         """Return block reason counts when track_block_reasons was enabled."""
@@ -111,9 +141,11 @@ class StrategyEngine:
         spread_bps = float(current_spread_bps) if current_spread_bps is not None else None
         minutes_since_open = float(features.get("minutes_since_open", 390.0))
 
+        side_for_funnel = prediction.direction
+
         if not self._universe.is_enabled(symbol):
             logger.debug("strategy_skip_disabled", symbol=symbol)
-            self._record_block("disabled")
+            self._record_block("disabled", symbol=symbol, side=side_for_funnel, prediction=prediction)
             return None
 
         if relative_volume < self._min_relative_volume:
@@ -123,7 +155,7 @@ class StrategyEngine:
                 relative_volume=relative_volume,
                 threshold=self._min_relative_volume,
             )
-            self._record_block("low_relative_volume")
+            self._record_block("low_relative_volume", symbol=symbol, side=side_for_funnel, prediction=prediction)
             return None
 
         if self._max_spread_bps is not None and spread_bps is not None and spread_bps > self._max_spread_bps:
@@ -133,12 +165,12 @@ class StrategyEngine:
                 spread_bps=spread_bps,
                 threshold=self._max_spread_bps,
             )
-            self._record_block("wide_spread")
+            self._record_block("wide_spread", symbol=symbol, side=side_for_funnel, prediction=prediction)
             return None
 
         if prediction.direction == "no_trade":
             logger.debug("strategy_skip_no_trade", symbol=symbol)
-            self._record_block("no_trade")
+            self._record_block("no_trade", symbol=symbol, side=side_for_funnel, prediction=prediction)
             return None
 
         min_confidence = self._dynamic_min_confidence(prediction.regime, minutes_since_open)
@@ -149,7 +181,7 @@ class StrategyEngine:
                 confidence=prediction.confidence,
                 threshold=min_confidence,
             )
-            self._record_block("low_confidence")
+            self._record_block("low_confidence", symbol=symbol, side=side_for_funnel, prediction=prediction)
             return None
 
         min_expected_move_bps = self._dynamic_min_expected_move(prediction.regime, relative_volume, spread_bps)
@@ -161,23 +193,37 @@ class StrategyEngine:
                 move_bps=prediction.expected_move_bps,
                 threshold=min_expected_move_bps,
             )
-            self._record_block("low_move")
+            self._record_block("low_move", symbol=symbol, side=side_for_funnel, prediction=prediction)
             return None
 
-        if prediction.no_trade_score > self._max_no_trade_score:
-            logger.debug("strategy_skip_filter", symbol=symbol, no_trade_score=prediction.no_trade_score)
-            self._record_block("filter")
+        if prediction.no_trade_score >= self._no_trade_score_hard_veto:
+            logger.debug(
+                "strategy_skip_filter",
+                symbol=symbol,
+                no_trade_score=prediction.no_trade_score,
+                hard_veto=self._no_trade_score_hard_veto,
+            )
+            self._record_block("filter", symbol=symbol, side=side_for_funnel, prediction=prediction)
             return None
 
         if has_open_position:
             logger.debug("strategy_skip_existing_position", symbol=symbol)
-            self._record_block("existing_position")
+            self._record_block("existing_position", symbol=symbol, side=side_for_funnel, prediction=prediction)
             return None
 
-        playbook = self._select_playbook(prediction=prediction, features=features, spread_bps=spread_bps)
+        playbook, playbook_fit, best_candidate = self._select_playbook(
+            prediction=prediction, features=features, spread_bps=spread_bps
+        )
         if playbook is None:
             logger.debug("strategy_skip_no_playbook", symbol=symbol, regime=prediction.regime)
-            self._record_block("no_playbook")
+            self._record_block(
+                "no_playbook",
+                symbol=symbol,
+                side=side_for_funnel,
+                prediction=prediction,
+                playbook_candidate=best_candidate,
+                best_playbook_fit=playbook_fit if playbook_fit > 0 else None,
+            )
             return None
 
         side = "buy" if prediction.direction == "long" else "sell"
@@ -216,6 +262,7 @@ class StrategyEngine:
 
         rationale = {
             "playbook": playbook_name,
+            "playbook_fit": playbook_fit,
             "regime": prediction.regime,
             "direction": prediction.direction,
             "confidence": prediction.confidence,
@@ -324,13 +371,14 @@ class StrategyEngine:
             price = current_price * (Decimal("1") - buffer_pct)
         return price.quantize(Decimal("0.01"))
 
-    def _select_playbook(
+    def _score_playbook_fit(
         self,
         *,
         prediction: ModelPrediction,
         features: dict[str, float],
         spread_bps: float | None,
-    ) -> dict[str, float | bool | str] | None:
+    ) -> list[tuple[str, float]]:
+        """Score each playbook fit 0-1. Returns [(name, score), ...]."""
         minutes_since_open = float(features.get("minutes_since_open", 390.0))
         momentum_5m = float(features.get("momentum_5m", 0.0))
         momentum_15m = float(features.get("momentum_15m", 0.0))
@@ -341,55 +389,95 @@ class StrategyEngine:
         orb_breakout_down = float(features.get("orb_breakout_down", 0.0))
 
         if spread_bps is not None and self._max_spread_bps is not None and spread_bps > self._max_spread_bps:
-            return None
+            return []
 
-        if (
-            minutes_since_open <= 60
-            and relative_volume >= max(1.2, self._min_relative_volume)
-            and (
-                (prediction.direction == "long" and orb_breakout_up > 0 and momentum_5m > 0 and distance_from_vwap >= 0)
-                or (prediction.direction == "short" and orb_breakout_down > 0 and momentum_5m < 0 and distance_from_vwap <= 0)
-            )
-        ):
-            return {
+        scores: list[tuple[str, float]] = []
+
+        min_rv = max(1.2, self._min_relative_volume)
+        time_orb = 1.0 if minutes_since_open <= 60 else 0.0
+        vol_orb = min(1.0, relative_volume / min_rv) if min_rv > 0 else 1.0
+        long_orb = (
+            prediction.direction == "long"
+            and orb_breakout_up > 0
+            and momentum_5m > 0
+            and distance_from_vwap >= 0
+        )
+        short_orb = (
+            prediction.direction == "short"
+            and orb_breakout_down > 0
+            and momentum_5m < 0
+            and distance_from_vwap <= 0
+        )
+        align_orb = 1.0 if (long_orb or short_orb) else 0.0
+        orb_fit = time_orb * vol_orb * align_orb
+        scores.append(("orb_continuation", orb_fit))
+
+        regime_cont = 1.0 if prediction.regime in {"trending_up", "trending_down", "high_volatility"} else 0.0
+        min_rv_cont = max(0.9, self._min_relative_volume)
+        vol_cont = min(1.0, relative_volume / min_rv_cont) if min_rv_cont > 0 else 1.0
+        long_cont = momentum_5m > 0 and momentum_15m > 0 and distance_from_vwap >= 0
+        short_cont = momentum_5m < 0 and momentum_15m < 0 and distance_from_vwap <= 0
+        align_cont = 1.0 if (
+            (prediction.direction == "long" and long_cont) or (prediction.direction == "short" and short_cont)
+        ) else 0.0
+        cont_fit = regime_cont * vol_cont * align_cont
+        scores.append(("vwap_continuation", cont_fit))
+
+        regime_rev = 1.0 if prediction.regime in {"mean_reverting", "low_volatility"} else 0.0
+        time_rev = 1.0 if minutes_since_open >= 30 else min(1.0, minutes_since_open / 30)
+        min_rv_rev = max(0.6, self._min_relative_volume * 0.75)
+        vol_rev = min(1.0, relative_volume / min_rv_rev) if min_rv_rev > 0 else 1.0
+        zscore_long = zscore_close <= -1.5 and distance_from_vwap < 0
+        zscore_short = zscore_close >= 1.5 and distance_from_vwap > 0
+        zscore_align = 1.0 if (
+            (prediction.direction == "long" and zscore_long) or (prediction.direction == "short" and zscore_short)
+        ) else 0.0
+        rev_fit = regime_rev * time_rev * vol_rev * zscore_align
+        scores.append(("vwap_reversion", rev_fit))
+
+        return scores
+
+    def _get_playbook_dict(self, name: str) -> dict[str, float | bool | str]:
+        """Return playbook config dict by name."""
+        playbooks = {
+            "orb_continuation": {
                 "name": "orb_continuation",
                 "volatility_multiplier": 1.2,
                 "reward_ratio": 2.25,
                 "hold_multiplier": 0.75,
                 "use_limit_entry": True,
-            }
-
-        if (
-            prediction.regime in {"trending_up", "trending_down", "high_volatility"}
-            and relative_volume >= max(0.9, self._min_relative_volume)
-            and (
-                (prediction.direction == "long" and momentum_5m > 0 and momentum_15m > 0 and distance_from_vwap >= 0)
-                or (prediction.direction == "short" and momentum_5m < 0 and momentum_15m < 0 and distance_from_vwap <= 0)
-            )
-        ):
-            return {
+            },
+            "vwap_continuation": {
                 "name": "vwap_continuation",
                 "volatility_multiplier": 1.0,
                 "reward_ratio": 2.0,
                 "hold_multiplier": 1.0,
                 "use_limit_entry": True,
-            }
-
-        if (
-            prediction.regime in {"mean_reverting", "low_volatility"}
-            and minutes_since_open >= 30
-            and relative_volume >= max(0.6, self._min_relative_volume * 0.75)
-            and (
-                (prediction.direction == "long" and zscore_close <= -1.5 and distance_from_vwap < 0)
-                or (prediction.direction == "short" and zscore_close >= 1.5 and distance_from_vwap > 0)
-            )
-        ):
-            return {
+            },
+            "vwap_reversion": {
                 "name": "vwap_reversion",
                 "volatility_multiplier": 0.75,
                 "reward_ratio": 1.5,
                 "hold_multiplier": 0.5,
                 "use_limit_entry": True,
-            }
+            },
+        }
+        return playbooks[name]
 
-        return None
+    def _select_playbook(
+        self,
+        *,
+        prediction: ModelPrediction,
+        features: dict[str, float],
+        spread_bps: float | None,
+    ) -> tuple[dict[str, float | bool | str] | None, float, str | None]:
+        """Select best playbook by fit score if above min_playbook_fit.
+        Returns (playbook_dict or None, best_fit_score, best_candidate_name for funnel).
+        """
+        fits = self._score_playbook_fit(prediction=prediction, features=features, spread_bps=spread_bps)
+        if not fits:
+            return (None, 0.0, None)
+        best_name, best_score = max(fits, key=lambda x: x[1])
+        if best_score < self._min_playbook_fit:
+            return (None, best_score, best_name)
+        return (self._get_playbook_dict(best_name), best_score, best_name)

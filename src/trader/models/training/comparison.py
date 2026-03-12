@@ -63,6 +63,12 @@ def format_comparison_console(reports: list[ComparisonReport]) -> str:
                 lines.append(f"    {reason}: {count}")
             if "risk_rejected_count" in bt:
                 lines.append(f"    risk_rejected: {bt['risk_rejected_count']}")
+        if "decision_funnel" in bt:
+            funnel = bt["decision_funnel"]
+            lines.append("  [decision funnel]")
+            total_by_reason = funnel.get("total_by_reason", {})
+            for reason, count in sorted(total_by_reason.items(), key=lambda x: -x[1]):
+                lines.append(f"    {reason}: {count}")
         lines.append("")
 
     if len(reports) >= 2:

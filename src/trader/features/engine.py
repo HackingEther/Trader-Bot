@@ -56,6 +56,7 @@ class FeatureEngine:
         symbol: str,
         timestamp: datetime | None = None,
         spread_bps: float | None = None,
+        benchmark_returns: dict[str, float] | None = None,
     ) -> dict:
         """Compute the full feature vector for a symbol.
 
@@ -130,6 +131,12 @@ class FeatureEngine:
             "minutes_since_open": mins,
             "time_bucket": float(t_bucket),
         }
+
+        if benchmark_returns:
+            ret_5m_val = float(ret_5m.iloc[last_idx])
+            for bench_sym, bench_ret in benchmark_returns.items():
+                if bench_sym != symbol:
+                    features[f"return_vs_{bench_sym.lower()}_5m"] = ret_5m_val - bench_ret
 
         for k, v in features.items():
             if np.isnan(v) or np.isinf(v):

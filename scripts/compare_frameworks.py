@@ -138,11 +138,16 @@ async def _run_config(
             "min_expected_move_bps": 5.0,
             "max_no_trade_score": 0.85,
             "track_block_reasons": True,
+            "funnel_audit": True,
+            "framework": f"{labels}_{validation_mode}",
         }
     else:
         strategy_config = {
             "min_confidence": settings.min_confidence,
             "min_expected_move_bps": settings.min_expected_move_bps,
+            "track_block_reasons": True,
+            "funnel_audit": True,
+            "framework": f"{labels}_{validation_mode}",
         }
     bt = BacktestEngine(session=session)
     backtest_results = await bt.run(

@@ -109,7 +109,19 @@ class TestStrategyEngine:
         assert intent.side == "sell"
 
     def test_skips_high_no_trade_score(self) -> None:
-        pred = _make_prediction(no_trade_score=0.8)
+        pred = _make_prediction(no_trade_score=0.9)
+        intent = self.engine.evaluate(pred, Decimal("150.00"), features=_make_features())
+        assert intent is None
+
+    def test_no_trade_score_soft_penalty_not_hard_block(self) -> None:
+        """no_trade_score 0.6 passes when hard_veto=0.85 (soft penalty only)."""
+        pred = _make_prediction(no_trade_score=0.6)
+        intent = self.engine.evaluate(pred, Decimal("150.00"), features=_make_features())
+        assert intent is not None
+
+    def test_no_trade_score_hard_veto_extreme(self) -> None:
+        """no_trade_score 0.9 still blocked when hard_veto=0.85."""
+        pred = _make_prediction(no_trade_score=0.9)
         intent = self.engine.evaluate(pred, Decimal("150.00"), features=_make_features())
         assert intent is None
 
@@ -197,7 +209,7 @@ class TestStrategyEngine:
         assert self.engine._build_limit_price(Decimal("-1"), "sell", 10.0) is None
 
     def test_select_playbook_orb_cutoff_falls_back_after_first_hour(self) -> None:
-        playbook = self.engine._select_playbook(
+        playbook, _, _ = self.engine._select_playbook(
             prediction=_make_prediction(direction="long", regime="trending_up"),
             features=_make_features(minutes_since_open=61.0),
             spread_bps=10.0,
@@ -207,7 +219,7 @@ class TestStrategyEngine:
         assert playbook["name"] == "vwap_continuation"
 
     def test_select_playbook_rejects_trend_setup_when_regime_mismatches(self) -> None:
-        playbook = self.engine._select_playbook(
+        playbook, _, _ = self.engine._select_playbook(
             prediction=_make_prediction(direction="long", regime="mean_reverting"),
             features=_make_features(minutes_since_open=61.0),
             spread_bps=10.0,
@@ -216,7 +228,7 @@ class TestStrategyEngine:
         assert playbook is None
 
     def test_select_playbook_requires_orb_volume_threshold(self) -> None:
-        playbook = self.engine._select_playbook(
+        playbook, _, _ = self.engine._select_playbook(
             prediction=_make_prediction(direction="long", regime="trending_up"),
             features=_make_features(relative_volume=1.19),
             spread_bps=10.0,
@@ -224,6 +236,39 @@ class TestStrategyEngine:
 
         assert playbook is not None
         assert playbook["name"] == "vwap_continuation"
+
+    def test_playbook_fit_scoring_selects_best(self) -> None:
+        """Best fit above threshold is selected."""
+        playbook, fit, _ = self.engine._select_playbook(
+            prediction=_make_prediction(direction="long", regime="trending_up"),
+            features=_make_features(minutes_since_open=45.0),
+            spread_bps=10.0,
+        )
+        assert playbook is not None
+        assert playbook["name"] == "orb_continuation"
+        assert fit >= 0.4
+
+    def test_playbook_fit_below_threshold_returns_none(self) -> None:
+        """All fits < min_playbook_fit -> no_playbook."""
+        engine = StrategyEngine(
+            universe=self.universe,
+            sizer=self.sizer,
+            min_confidence=0.6,
+            min_expected_move_bps=15.0,
+            min_relative_volume=0.0,
+            min_playbook_fit=0.9,
+        )
+        playbook, fit, _ = engine._select_playbook(
+            prediction=_make_prediction(direction="long", regime="mean_reverting"),
+            features=_make_features(
+                minutes_since_open=90.0,
+                zscore_close_20=0.0,
+                distance_from_vwap=15.0,
+            ),
+            spread_bps=10.0,
+        )
+        assert playbook is None
+        assert fit < 0.9
 
     def test_block_stats_tracked_when_enabled(self) -> None:
         engine = StrategyEngine(
