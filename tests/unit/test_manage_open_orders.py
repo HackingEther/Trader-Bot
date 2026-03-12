@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
+from typing import Callable
 
 import pytest
 import trader.db.models  # noqa: F401
@@ -43,10 +44,17 @@ class _BrokerOrder:
 
 
 class _FakeBroker:
-    def __init__(self, orders: dict[str, _BrokerOrder], failing_ids: set[str] | None = None) -> None:
+    def __init__(
+        self,
+        orders: dict[str, _BrokerOrder],
+        failing_ids: set[str] | None = None,
+        replace_order: Callable | None = None,
+    ) -> None:
         self._orders = orders
         self._failing_ids = failing_ids or set()
+        self._replace_order = replace_order
         self.cancelled_ids: list[str] = []
+        self.replaced_orders: list[tuple[str, Decimal | None]] = []
 
     async def get_order(self, broker_order_id: str) -> _BrokerOrder:
         if broker_order_id in self._failing_ids:
@@ -56,6 +64,21 @@ class _FakeBroker:
     async def cancel_order(self, broker_order_id: str) -> _BrokerOrder:
         self.cancelled_ids.append(broker_order_id)
         return _BrokerOrder(broker_order_id=broker_order_id, status="cancelled")
+
+    async def replace_order(
+        self, broker_order_id: str, qty: int | None = None, limit_price: Decimal | None = None
+    ) -> _BrokerOrder:
+        self.replaced_orders.append((broker_order_id, limit_price))
+        if self._replace_order:
+            return await self._replace_order(broker_order_id, qty, limit_price)
+        base = self._orders.get(broker_order_id, _BrokerOrder(broker_order_id=broker_order_id, status="accepted"))
+        return _BrokerOrder(
+            broker_order_id=broker_order_id,
+            status=base.status,
+            filled_qty=base.filled_qty,
+            filled_avg_price=base.filled_avg_price,
+            raw=base.raw,
+        )
 
 
 async def _seed_orders(factory: async_sessionmaker[AsyncSession]) -> None:
@@ -232,6 +255,7 @@ def test_manage_open_orders_cancels_stale_records_fill_delta_and_isolates_errors
         "synced": 3,
         "filled": 2,
         "fills_recorded": 3,
+        "repriced": 0,
         "cancelled": 1,
         "errors": 1,
     }
@@ -447,3 +471,88 @@ def test_manage_open_orders_recent_order_not_cancelled(
     tasks.manage_open_orders()
 
     assert "recent-order" not in broker.cancelled_ids
+
+
+def test_manage_open_orders_bounded_reprice_increments_count_and_enforces_bounds(
+    monkeypatch: pytest.MonkeyPatch,
+    db_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Reprice increments reprice_count; respects max_attempts and min_interval."""
+
+    async def _seed_reprice_order() -> None:
+        now = datetime.now(timezone.utc)
+        reprice_window = now - timedelta(seconds=120)
+        async with db_factory() as session:
+            session.add(
+                Order(
+                    idempotency_key="reprice-key",
+                    broker_order_id="reprice-order",
+                    symbol="AAPL",
+                    side="buy",
+                    order_type="limit",
+                    order_class="simple",
+                    time_in_force="day",
+                    qty=10,
+                    limit_price=Decimal("150.00"),
+                    status="accepted",
+                    strategy_tag="test",
+                    rationale={},
+                    broker_metadata={},
+                    created_at=reprice_window,
+                    updated_at=reprice_window,
+                    submitted_at=reprice_window,
+                    reprice_count=0,
+                )
+            )
+            await session.commit()
+
+    asyncio.run(_seed_reprice_order())
+
+    broker = _FakeBroker(
+        orders={
+            "reprice-order": _BrokerOrder(
+                broker_order_id="reprice-order",
+                status="accepted",
+                filled_qty=0,
+            ),
+        },
+    )
+
+    settings = SimpleNamespace(
+        open_order_stale_seconds=9000,
+        reprice_after_seconds=60,
+        reprice_max_age_seconds=300,
+        reprice_max_attempts=3,
+        reprice_min_interval_seconds=30,
+        reprice_max_drift_bps=20.0,
+        limit_entry_buffer_bps=5.0,
+        use_marketable_limits=True,
+        marketable_limit_buffer_bps=5.0,
+    )
+
+    async def _mock_get_last_quote(symbol: str) -> dict | None:
+        return {"bid": 149.95, "ask": 150.05, "mid": 150.0, "spread_bps": 6.67}
+
+    async def _noop() -> None:
+        return None
+
+    monkeypatch.setattr(tasks, "_bootstrap", lambda: (settings, db_factory, broker))
+    monkeypatch.setattr(tasks, "_ensure_redis", _noop)
+    with monkeypatch.context() as m:
+        mock_store = SimpleNamespace(get_last_quote=_mock_get_last_quote)
+        m.setattr(tasks, "SystemStateStore", lambda: mock_store)
+
+        result = tasks.manage_open_orders()
+
+    assert result["repriced"] == 1
+    assert len(broker.replaced_orders) == 1
+    assert broker.replaced_orders[0][0] == "reprice-order"
+
+    async def _assert_reprice_count() -> None:
+        async with db_factory() as session:
+            order = await OrderRepository(session).get_by_broker_order_id("reprice-order")
+            assert order is not None
+            assert getattr(order, "reprice_count", 0) == 1
+            assert getattr(order, "last_reprice_at", None) is not None
+
+    asyncio.run(_assert_reprice_count())

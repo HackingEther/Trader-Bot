@@ -37,6 +37,8 @@ class Order(Base, TimestampMixin):
     filled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     error_message: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    reprice_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_reprice_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         Index("ix_orders_symbol_status", "symbol", "status"),

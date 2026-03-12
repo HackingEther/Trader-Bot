@@ -28,6 +28,7 @@ from trader.config import get_settings
 from trader.core.redis_client import close_redis, init_redis
 from trader.db.session import close_engine, init_engine
 from trader.ingestion.manager import IngestionManager
+from trader.ingestion.trade_updates import TradeUpdateStream
 from trader.logging import setup_logging
 from trader.providers.market_data.factory import create_market_data_provider
 
@@ -42,6 +43,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     init_engine(settings.database_url)
     ingestion_manager: IngestionManager | None = None
     ingestion_task = None
+    trade_updates_stream: TradeUpdateStream | None = None
+    trade_updates_task = None
     try:
         await init_redis(settings.redis_url)
     except Exception as e:
@@ -86,7 +89,36 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 error=str(e),
             )
 
+    if getattr(settings, "trade_updates_stream_enabled", True) and settings.alpaca_api_key and settings.alpaca_api_secret:
+        try:
+            from trader.providers.broker.factory import create_broker_provider
+
+            broker = create_broker_provider(settings)
+            trade_updates_stream = TradeUpdateStream(
+                api_key=settings.alpaca_api_key,
+                api_secret=settings.alpaca_api_secret,
+                paper=settings.alpaca_paper,
+                broker=broker,
+            )
+            trade_updates_task = asyncio.create_task(trade_updates_stream.start())
+            logger.info("trade_updates_stream_enabled")
+        except Exception as e:
+            logger.warning("trade_updates_stream_start_failed", error=str(e))
+
     yield
+
+    if trade_updates_stream is not None:
+        try:
+            await trade_updates_stream.stop()
+        except Exception as e:
+            logger.warning("trade_updates_stream_shutdown_failed", error=str(e))
+    if trade_updates_task is not None:
+        try:
+            await trade_updates_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
 
     if ingestion_manager is not None:
         try:

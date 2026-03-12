@@ -12,6 +12,7 @@ from trader.core.enums import OrderStatus
 from trader.core.exceptions import DuplicateOrderError, OrderSubmissionError
 from trader.db.models.order import Order
 from trader.db.repositories.orders import OrderRepository
+from trader.db.repositories.quote_snapshots import QuoteSnapshotRepository
 from trader.execution.idempotency import generate_idempotency_key
 from trader.execution.lifecycle import OrderLifecycleTracker
 from trader.execution.position_ledger import PositionLedger
@@ -34,6 +35,7 @@ class ExecutionEngine:
         self._broker = broker
         self._session = session
         self._repo = OrderRepository(session)
+        self._quote_snapshots = QuoteSnapshotRepository(session)
         self._lifecycle = OrderLifecycleTracker(session)
         self._positions = PositionLedger(session)
         self._state_store = state_store or SystemStateStore()
@@ -97,6 +99,24 @@ class ExecutionEngine:
             )
 
             broker_order = await self._broker.submit_order(broker_request)
+            submit_ts = datetime.now(timezone.utc)
+            quote = await self._state_store.get_last_quote(intent.symbol)
+            if quote and quote.get("bid") is not None and quote.get("ask") is not None:
+                bid = Decimal(str(quote["bid"]))
+                ask = Decimal(str(quote["ask"]))
+                mid = (bid + ask) / 2
+                spread_bps = Decimal(str(quote.get("spread_bps", 0) or 0))
+                await self._quote_snapshots.create_snapshot(
+                    snapshot_type="submit",
+                    symbol=intent.symbol,
+                    bid=bid,
+                    ask=ask,
+                    mid=mid,
+                    timestamp=submit_ts,
+                    spread_bps=spread_bps,
+                    trade_intent_id=trade_intent_id,
+                    order_id=order.id,
+                )
             await self._sync_child_orders(parent_order=order, broker_order=broker_order)
 
             await self._lifecycle.update_status(

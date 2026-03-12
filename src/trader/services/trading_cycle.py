@@ -18,6 +18,7 @@ from trader.db.models.risk_decision import RiskDecisionRecord
 from trader.db.models.trade_intent import TradeIntent
 from trader.db.repositories.feature_snapshots import FeatureSnapshotRepository
 from trader.db.repositories.orders import OrderRepository
+from trader.db.repositories.quote_snapshots import QuoteSnapshotRepository
 from trader.db.repositories.market_bars import MarketBarRepository
 from trader.db.repositories.model_predictions import ModelPredictionRepository
 from trader.db.repositories.pnl_snapshots import PnlSnapshotRepository
@@ -79,6 +80,7 @@ class TradingCycleService:
 
         self._market_bars = MarketBarRepository(session)
         self._feature_snapshots = FeatureSnapshotRepository(session)
+        self._quote_snapshots = QuoteSnapshotRepository(session)
         self._predictions = ModelPredictionRepository(session)
         self._trade_intents = TradeIntentRepository(session)
         self._risk_decisions = RiskDecisionRepository(session)
@@ -296,6 +298,7 @@ class TradingCycleService:
         latest_bar = bars[-1]
         timestamp = latest_bar.timestamp
         spread_bps = await self._state_store.get_spread_bps(symbol)
+        quote = await self._state_store.get_last_quote(symbol)
         features = feature_engine.compute_features(symbol, timestamp, spread_bps=spread_bps)
         feature_snapshot = await self._feature_snapshots.create(
             symbol=symbol,
@@ -318,6 +321,8 @@ class TradingCycleService:
             min_relative_volume=self._settings.min_relative_volume,
             max_spread_bps=self._settings.spread_threshold_bps,
             limit_entry_buffer_bps=self._settings.limit_entry_buffer_bps,
+            use_marketable_limits=getattr(self._settings, "use_marketable_limits", True),
+            marketable_limit_buffer_bps=getattr(self._settings, "marketable_limit_buffer_bps", 5.0),
         )
 
         has_broker_position = await self._broker.get_position(symbol) is not None
@@ -328,17 +333,47 @@ class TradingCycleService:
             has_open_position=has_broker_position,
             features=features,
             current_spread_bps=spread_bps,
+            quote_at_decision=quote,
         )
         if intent is None:
             return SymbolCycleResult(symbol=symbol, status="predicted", reason="strategy_filtered")
 
+        quote_at_decision = None
+        decision_snapshot_id = None
+        if quote:
+            quote_at_decision = {
+                "bid": quote.get("bid"),
+                "ask": quote.get("ask"),
+                "mid": quote.get("mid"),
+                "spread_bps": quote.get("spread_bps"),
+                "timestamp": quote.get("timestamp"),
+                "last_bar_ts": latest_bar.timestamp.isoformat(),
+            }
         intent.model_prediction_id = prediction_record.id
         intent.rationale = {
             **intent.rationale,
             "reference_price": str(latest_bar.close),
             "reference_timestamp": latest_bar.timestamp.isoformat(),
+            "quote_at_decision": quote_at_decision,
         }
         intent_record = await self._persist_trade_intent(intent, timestamp=timestamp)
+        if quote and quote.get("bid") is not None and quote.get("ask") is not None:
+            bid = Decimal(str(quote["bid"]))
+            ask = Decimal(str(quote["ask"]))
+            mid = (bid + ask) / 2
+            spread_bps = Decimal(str(quote.get("spread_bps", 0) or 0))
+            snapshot = await self._quote_snapshots.create_snapshot(
+                snapshot_type="decision",
+                symbol=symbol,
+                bid=bid,
+                ask=ask,
+                mid=mid,
+                timestamp=timestamp,
+                spread_bps=spread_bps,
+                trade_intent_id=intent_record.id,
+            )
+            decision_snapshot_id = snapshot.id
+            intent.rationale["decision_quote_snapshot_id"] = decision_snapshot_id
         score = self._score_candidate(prediction=prediction, features=features)
         return PreparedSignal(
             symbol=symbol,

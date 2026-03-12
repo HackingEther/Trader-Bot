@@ -81,7 +81,17 @@ class Settings(BaseSettings):
     min_relative_volume: float = Field(default=0.8)
     max_signals_per_cycle: int = Field(default=3)
     limit_entry_buffer_bps: float = Field(default=5.0)
+    marketable_limit_buffer_bps: float = Field(default=5.0)
+    use_marketable_limits: bool = Field(default=True)
     open_order_stale_seconds: int = Field(default=90)
+    reprice_after_seconds: int = Field(default=60)
+    reprice_max_age_seconds: int = Field(default=300)
+    reprice_max_attempts: int = Field(default=3)
+    reprice_min_interval_seconds: int = Field(default=30)
+    reprice_max_drift_bps: float = Field(default=20.0)
+
+    # ── Streaming ──
+    trade_updates_stream_enabled: bool = Field(default=True)
 
     # ── Notifications ──
     slack_webhook_url: str = Field(default="")

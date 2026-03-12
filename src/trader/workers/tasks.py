@@ -16,8 +16,10 @@ from trader.core.redis_client import init_redis
 from trader.db.session import close_engine, get_session_factory, init_engine, reset_engine_for_celery
 from trader.features.engine import FeatureEngine
 from trader.providers.broker.factory import create_broker_provider
+from trader.db.repositories.execution_attribution import ExecutionAttributionRepository
 from trader.db.repositories.fills import FillRepository
 from trader.db.repositories.orders import OrderRepository
+from trader.db.repositories.quote_snapshots import QuoteSnapshotRepository
 from trader.db.repositories.trade_intents import TradeIntentRepository
 from trader.execution.lifecycle import OrderLifecycleTracker
 from trader.execution.position_ledger import PositionLedger
@@ -86,6 +88,31 @@ def _coerce_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def _limit_price_from_quote(
+    quote: dict,
+    side: str,
+    buffer_bps: float,
+    spread_bps: float,
+    use_marketable: bool = True,
+    marketable_buffer_bps: float = 5.0,
+) -> Decimal | None:
+    """Compute limit price from quote for repricing."""
+    bid = quote.get("bid")
+    ask = quote.get("ask")
+    if bid is None or ask is None or float(bid) <= 0 or float(ask) <= 0:
+        return None
+    if use_marketable:
+        effective_bps = marketable_buffer_bps
+    else:
+        effective_bps = max(buffer_bps, spread_bps * 0.75)
+    buffer_pct = Decimal(str(effective_bps)) / Decimal("10000")
+    if side == "buy":
+        price = Decimal(str(ask)) * (Decimal("1") + buffer_pct)
+    else:
+        price = Decimal(str(bid)) * (Decimal("1") - buffer_pct)
+    return price.quantize(Decimal("0.01"))
 
 
 def _fill_timestamp_from_raw(raw: dict | None, fallback: datetime) -> datetime:
@@ -227,6 +254,8 @@ def manage_open_orders() -> dict:
                 trade_intents = TradeIntentRepository(session)
                 lifecycle = OrderLifecycleTracker(session)
                 ledger = PositionLedger(session)
+                quote_snapshots = QuoteSnapshotRepository(session)
+                attribution_repo = ExecutionAttributionRepository(session)
 
                 async def _sync_snapshot(order, broker_order) -> tuple[int, int]:
                     recorded = 0
@@ -330,6 +359,14 @@ def manage_open_orders() -> dict:
 
                     if broker_order.status == "filled":
                         completed += 1
+                        order_for_attr = await orders.get_by_id(order.id)
+                        if order_for_attr:
+                            order_fills = await fills.get_by_order_id(order.id)
+                            await attribution_repo.ensure_attribution_for_filled_order(
+                                order=order_for_attr,
+                                fills=order_fills,
+                                quote_snapshots=quote_snapshots,
+                            )
                     return recorded, completed
 
             open_orders = await orders.get_open_orders()
@@ -337,8 +374,10 @@ def manage_open_orders() -> dict:
             cancelled = 0
             filled = 0
             fill_recorded = 0
+            repriced = 0
             errors = 0
             now = datetime.now(timezone.utc)
+            state_store = SystemStateStore()
 
             for order in open_orders:
                 if not order.broker_order_id:
@@ -353,11 +392,90 @@ def manage_open_orders() -> dict:
                     if broker_order.status == "filled":
                         continue
 
+                    age_anchor = _coerce_utc(order.submitted_at or order.created_at)
+                    age_seconds = (now - age_anchor).total_seconds()
+
+                    reprice_after = getattr(settings, "reprice_after_seconds", 60)
+                    reprice_max = getattr(settings, "reprice_max_age_seconds", 300)
+                    reprice_max_attempts = getattr(settings, "reprice_max_attempts", 3)
+                    reprice_min_interval = getattr(settings, "reprice_min_interval_seconds", 30)
+                    reprice_max_drift_bps = getattr(settings, "reprice_max_drift_bps", 20.0)
+                    reprice_count = getattr(order, "reprice_count", 0) or 0
+                    last_reprice_at = getattr(order, "last_reprice_at", None)
+                    interval_ok = (
+                        last_reprice_at is None
+                        or (now - _coerce_utc(last_reprice_at)).total_seconds() >= reprice_min_interval
+                    )
+                    attempts_ok = reprice_count < reprice_max_attempts
+                    if (
+                        order.order_type == "limit"
+                        and order.limit_price is not None
+                        and broker_order.status in {"accepted", "partially_filled"}
+                        and reprice_after <= age_seconds <= reprice_max
+                        and attempts_ok
+                        and interval_ok
+                    ):
+                        quote = await state_store.get_last_quote(order.symbol)
+                        if quote:
+                            new_limit = _limit_price_from_quote(
+                                quote=quote,
+                                side=order.side,
+                                buffer_bps=settings.limit_entry_buffer_bps,
+                                spread_bps=float(quote.get("spread_bps", 0) or 0),
+                                use_marketable=getattr(settings, "use_marketable_limits", True),
+                                marketable_buffer_bps=getattr(settings, "marketable_limit_buffer_bps", 5.0),
+                            )
+                            if new_limit is not None:
+                                tick = Decimal("0.01")
+                                drift_bps = abs(new_limit - order.limit_price) / order.limit_price * Decimal("10000")
+                                drift_ok = float(drift_bps) <= reprice_max_drift_bps
+                                if abs(new_limit - order.limit_price) > tick and drift_ok:
+                                    try:
+                                        replaced = await broker.replace_order(
+                                            order.broker_order_id,
+                                            limit_price=new_limit,
+                                        )
+                                        await lifecycle.update_status(
+                                            order_id=order.id,
+                                            new_status=replaced.status,
+                                            filled_qty=replaced.filled_qty,
+                                            filled_avg_price=float(replaced.filled_avg_price)
+                                            if replaced.filled_avg_price else None,
+                                        )
+                                        await orders.update_by_id(
+                                            order.id,
+                                            limit_price=new_limit,
+                                            reprice_count=reprice_count + 1,
+                                            last_reprice_at=now,
+                                        )
+                                        if quote.get("bid") is not None and quote.get("ask") is not None:
+                                            bid = Decimal(str(quote["bid"]))
+                                            ask = Decimal(str(quote["ask"]))
+                                            mid = (bid + ask) / 2
+                                            spread_bps = Decimal(str(quote.get("spread_bps", 0) or 0))
+                                            await quote_snapshots.create_snapshot(
+                                                snapshot_type="replace",
+                                                symbol=order.symbol,
+                                                bid=bid,
+                                                ask=ask,
+                                                mid=mid,
+                                                timestamp=now,
+                                                spread_bps=spread_bps,
+                                                trade_intent_id=order.trade_intent_id,
+                                                order_id=order.id,
+                                            )
+                                        repriced += 1
+                                        continue
+                                    except Exception as reprice_exc:
+                                        logger.debug(
+                                            "reprice_failed",
+                                            order_id=order.id,
+                                            error=str(reprice_exc),
+                                        )
+
                     if broker_order.status == "partially_filled":
                         continue
 
-                    age_anchor = _coerce_utc(order.submitted_at or order.created_at)
-                    age_seconds = (now - age_anchor).total_seconds()
                     if age_seconds <= settings.open_order_stale_seconds:
                         continue
                     if broker_order.status not in {"pending", "submitted", "accepted", "partially_filled"}:
@@ -385,6 +503,7 @@ def manage_open_orders() -> dict:
                 "synced": synced,
                 "filled": filled,
                 "fills_recorded": fill_recorded,
+                "repriced": repriced,
                 "cancelled": cancelled,
                 "errors": errors,
             }
@@ -416,6 +535,62 @@ def execute_trading_cycle() -> dict:
                 results = await service.run_cycle()
                 logger.info("trading_cycle_complete", **results)
                 return results
+        finally:
+            await close_engine()
+
+    return asyncio.run(_run())
+
+
+@celery.task(name="trader.workers.tasks.enforce_max_hold_exits")
+def enforce_max_hold_exits() -> dict:
+    """Close positions that have exceeded max_hold_minutes."""
+    reset_engine_for_celery()
+
+    async def _run() -> dict:
+        try:
+            _, factory, broker = _bootstrap()
+            await _ensure_redis()
+            async with factory() as session:
+                from trader.db.repositories.positions import PositionRepository
+
+                repo = PositionRepository(session)
+                open_positions = await repo.get_open_positions()
+                now = datetime.now(timezone.utc)
+                closed = 0
+                errors = 0
+                for pos in open_positions:
+                    opened_at = _coerce_utc(pos.opened_at)
+                    if opened_at is None:
+                        continue
+                    hold_minutes = (now - opened_at).total_seconds() / 60.0
+                    max_hold = 60
+                    if isinstance(pos.metadata_, dict):
+                        max_hold = int(pos.metadata_.get("max_hold_minutes", 60))
+                    if hold_minutes < max_hold:
+                        continue
+                    try:
+                        await broker.close_position(pos.symbol)
+                        await repo.update_by_id(
+                            pos.id,
+                            status="closed",
+                            closed_at=now,
+                        )
+                        closed += 1
+                        logger.info(
+                            "max_hold_exit",
+                            symbol=pos.symbol,
+                            hold_minutes=hold_minutes,
+                            max_hold=max_hold,
+                        )
+                    except Exception as exc:
+                        errors += 1
+                        logger.exception(
+                            "max_hold_exit_failed",
+                            symbol=pos.symbol,
+                            error=str(exc),
+                        )
+                await session.commit()
+                return {"closed": closed, "errors": errors}
         finally:
             await close_engine()
 

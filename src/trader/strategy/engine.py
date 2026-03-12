@@ -62,6 +62,8 @@ class StrategyEngine:
         max_no_trade_score: float = 0.5,
         default_max_hold_minutes: int = 60,
         track_block_reasons: bool = False,
+        use_marketable_limits: bool = True,
+        marketable_limit_buffer_bps: float = 5.0,
     ) -> None:
         self._universe = universe
         self._sizer = sizer
@@ -70,6 +72,8 @@ class StrategyEngine:
         self._min_relative_volume = min_relative_volume
         self._max_spread_bps = max_spread_bps
         self._limit_entry_buffer_bps = limit_entry_buffer_bps
+        self._use_marketable_limits = use_marketable_limits
+        self._marketable_limit_buffer_bps = marketable_limit_buffer_bps
         self._max_no_trade_score = max_no_trade_score
         self._default_max_hold = default_max_hold_minutes
         self._track_block_reasons = track_block_reasons
@@ -294,9 +298,12 @@ class StrategyEngine:
         ask = quote.get("ask")
         if bid is None or ask is None or float(bid) <= 0 or float(ask) <= 0:
             return None
-        buffer_bps = self._limit_entry_buffer_bps
-        if spread_bps is not None:
-            buffer_bps = max(buffer_bps, spread_bps * 0.75)
+        if self._use_marketable_limits:
+            buffer_bps = self._marketable_limit_buffer_bps
+        else:
+            buffer_bps = self._limit_entry_buffer_bps
+            if spread_bps is not None:
+                buffer_bps = max(buffer_bps, spread_bps * 0.75)
         buffer_pct = Decimal(str(buffer_bps)) / Decimal("10000")
         if side == "buy":
             price = Decimal(str(ask)) * (Decimal("1") + buffer_pct)

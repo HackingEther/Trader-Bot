@@ -22,6 +22,7 @@ from trader.db.models.order import Order
 from trader.db.models.position import Position
 from trader.db.repositories.orders import OrderRepository
 from trader.db.repositories.positions import PositionRepository
+from trader.db.repositories.quote_snapshots import QuoteSnapshotRepository
 from trader.db.repositories.trade_intents import TradeIntentRepository
 from trader.providers.broker.base import (
     BrokerAccount,
@@ -168,9 +169,16 @@ class _MockModelLoader:
 class _MockStateStore:
     """State store with configurable kill switch and spread."""
 
-    def __init__(self, *, kill_switch: bool = False, spread_bps: float = 10.0) -> None:
+    def __init__(
+        self,
+        *,
+        kill_switch: bool = False,
+        spread_bps: float = 10.0,
+        quote: dict | None = None,
+    ) -> None:
         self._kill_switch = kill_switch
         self._spread_bps = spread_bps
+        self._quote = quote
 
     async def is_kill_switch_active(self) -> bool:
         return self._kill_switch
@@ -180,6 +188,9 @@ class _MockStateStore:
 
     async def get_last_bar_timestamp(self, symbol: str) -> datetime | None:
         return datetime.now(timezone.utc)
+
+    async def get_last_quote(self, symbol: str) -> dict | None:
+        return self._quote
 
 
 def _test_settings(**overrides) -> Settings:
@@ -301,6 +312,42 @@ async def test_run_cycle_full_flow_bars_to_execution(
     assert len(executed) >= 1
     assert len(orders) >= 1
     assert len(positions) >= 1
+
+
+@pytest.mark.asyncio
+@patch("trader.risk.rules.market_hours.is_market_open", return_value=True)
+async def test_trading_cycle_persists_decision_quote_snapshot(
+    _mock_market_open: object,
+    db_session_with_bars: async_sessionmaker[AsyncSession],
+) -> None:
+    """When quote is available at decision time, a decision quote snapshot is persisted."""
+    quote = {"bid": 149.95, "ask": 150.05, "mid": 150.0, "spread_bps": 6.67}
+    state_store = _MockStateStore(quote=quote)
+    settings = _test_settings()
+    broker = _MockBrokerProvider(fill_orders=True)
+    model_loader = _MockModelLoader()
+
+    async with db_session_with_bars() as session:
+        service = TradingCycleService(
+            settings=settings,
+            session=session,
+            broker=broker,
+            model_loader=model_loader,
+            state_store=state_store,
+        )
+        await service.run_cycle(symbols=["AAPL"])
+
+    async with db_session_with_bars() as session:
+        intents = await TradeIntentRepository(session).get_recent(limit=1)
+        assert len(intents) >= 1
+        quote_repo = QuoteSnapshotRepository(session)
+        decision_snapshot = await quote_repo.get_decision_for_trade_intent(intents[0].id)
+
+    assert decision_snapshot is not None
+    assert decision_snapshot.snapshot_type == "decision"
+    assert decision_snapshot.symbol == "AAPL"
+    assert float(decision_snapshot.bid) == pytest.approx(149.95, rel=0.01)
+    assert float(decision_snapshot.ask) == pytest.approx(150.05, rel=0.01)
 
 
 @pytest.mark.asyncio
