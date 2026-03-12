@@ -61,6 +61,7 @@ class StrategyEngine:
         limit_entry_buffer_bps: float = 5.0,
         max_no_trade_score: float = 0.5,
         default_max_hold_minutes: int = 60,
+        track_block_reasons: bool = False,
     ) -> None:
         self._universe = universe
         self._sizer = sizer
@@ -71,6 +72,20 @@ class StrategyEngine:
         self._limit_entry_buffer_bps = limit_entry_buffer_bps
         self._max_no_trade_score = max_no_trade_score
         self._default_max_hold = default_max_hold_minutes
+        self._track_block_reasons = track_block_reasons
+        self._block_counts: dict[str, int] = {}
+
+    def _record_block(self, reason: str) -> None:
+        if self._track_block_reasons:
+            self._block_counts[reason] = self._block_counts.get(reason, 0) + 1
+
+    def get_block_stats(self) -> dict[str, int]:
+        """Return block reason counts when track_block_reasons was enabled."""
+        return dict(self._block_counts)
+
+    def reset_block_stats(self) -> None:
+        """Clear block counts for a fresh run."""
+        self._block_counts.clear()
 
     def evaluate(
         self,
@@ -80,6 +95,7 @@ class StrategyEngine:
         has_open_position: bool = False,
         features: dict[str, float] | None = None,
         current_spread_bps: float | None = None,
+        quote_at_decision: dict | None = None,
     ) -> TradeIntentParams | None:
         """Evaluate a prediction and generate a trade intent if warranted.
 
@@ -93,6 +109,7 @@ class StrategyEngine:
 
         if not self._universe.is_enabled(symbol):
             logger.debug("strategy_skip_disabled", symbol=symbol)
+            self._record_block("disabled")
             return None
 
         if relative_volume < self._min_relative_volume:
@@ -102,6 +119,7 @@ class StrategyEngine:
                 relative_volume=relative_volume,
                 threshold=self._min_relative_volume,
             )
+            self._record_block("low_relative_volume")
             return None
 
         if self._max_spread_bps is not None and spread_bps is not None and spread_bps > self._max_spread_bps:
@@ -111,10 +129,12 @@ class StrategyEngine:
                 spread_bps=spread_bps,
                 threshold=self._max_spread_bps,
             )
+            self._record_block("wide_spread")
             return None
 
         if prediction.direction == "no_trade":
             logger.debug("strategy_skip_no_trade", symbol=symbol)
+            self._record_block("no_trade")
             return None
 
         min_confidence = self._dynamic_min_confidence(prediction.regime, minutes_since_open)
@@ -125,29 +145,35 @@ class StrategyEngine:
                 confidence=prediction.confidence,
                 threshold=min_confidence,
             )
+            self._record_block("low_confidence")
             return None
 
         min_expected_move_bps = self._dynamic_min_expected_move(prediction.regime, relative_volume, spread_bps)
-        if prediction.expected_move_bps < min_expected_move_bps:
+        move_magnitude = abs(prediction.expected_move_bps)
+        if move_magnitude < min_expected_move_bps:
             logger.debug(
                 "strategy_skip_low_move",
                 symbol=symbol,
                 move_bps=prediction.expected_move_bps,
                 threshold=min_expected_move_bps,
             )
+            self._record_block("low_move")
             return None
 
         if prediction.no_trade_score > self._max_no_trade_score:
             logger.debug("strategy_skip_filter", symbol=symbol, no_trade_score=prediction.no_trade_score)
+            self._record_block("filter")
             return None
 
         if has_open_position:
             logger.debug("strategy_skip_existing_position", symbol=symbol)
+            self._record_block("existing_position")
             return None
 
         playbook = self._select_playbook(prediction=prediction, features=features, spread_bps=spread_bps)
         if playbook is None:
             logger.debug("strategy_skip_no_playbook", symbol=symbol, regime=prediction.regime)
+            self._record_block("no_playbook")
             return None
 
         side = "buy" if prediction.direction == "long" else "sell"
@@ -157,7 +183,7 @@ class StrategyEngine:
         hold_multiplier = playbook["hold_multiplier"]
         use_limit_entry = playbook["use_limit_entry"]
 
-        vol_estimate = max(0.005, prediction.expected_move_bps / 10000.0) * volatility_multiplier
+        vol_estimate = max(0.005, abs(prediction.expected_move_bps) / 10000.0) * volatility_multiplier
         qty = self._sizer.compute_qty(current_price, stop_distance_pct=vol_estimate, account_equity=account_equity)
         qty = max(1, int(qty * self._position_adjustment(relative_volume, spread_bps)))
 
@@ -178,7 +204,9 @@ class StrategyEngine:
         entry_order_type = "market"
         limit_price: Decimal | None = None
         if use_limit_entry:
-            limit_price = self._build_limit_price(current_price, side, spread_bps)
+            limit_price = self._build_limit_price_from_quote(
+                quote_at_decision, side, spread_bps
+            ) or self._build_limit_price(current_price, side, spread_bps)
             if limit_price is not None:
                 entry_order_type = "limit"
 
@@ -255,6 +283,26 @@ class StrategyEngine:
             spread_penalty = max(0.4, 1.0 - min(spread_bps / max(self._max_spread_bps, 1.0), 0.6))
         volume_boost = min(1.25, max(0.75, relative_volume))
         return max(0.5, min(1.25, spread_penalty * volume_boost))
+
+    def _build_limit_price_from_quote(
+        self, quote: dict | None, side: str, spread_bps: float | None
+    ) -> Decimal | None:
+        """Build limit price from bid/ask when quote is available."""
+        if not quote:
+            return None
+        bid = quote.get("bid")
+        ask = quote.get("ask")
+        if bid is None or ask is None or float(bid) <= 0 or float(ask) <= 0:
+            return None
+        buffer_bps = self._limit_entry_buffer_bps
+        if spread_bps is not None:
+            buffer_bps = max(buffer_bps, spread_bps * 0.75)
+        buffer_pct = Decimal(str(buffer_bps)) / Decimal("10000")
+        if side == "buy":
+            price = Decimal(str(ask)) * (Decimal("1") + buffer_pct)
+        else:
+            price = Decimal(str(bid)) * (Decimal("1") - buffer_pct)
+        return price.quantize(Decimal("0.01"))
 
     def _build_limit_price(self, current_price: Decimal, side: str, spread_bps: float | None) -> Decimal | None:
         if current_price <= 0:

@@ -62,6 +62,7 @@ async def _run_config(
     purge_bars: int,
     embargo_bars: int,
     train_regime_legacy: bool,
+    diagnostic_mode: bool = False,
 ) -> tuple[dict, dict, list[dict] | None, dict | None]:
     """Train models and run backtest. Returns (training_metrics, backtest_metrics, fold_metrics, aggregate)."""
     if labels == "tradable":
@@ -131,6 +132,18 @@ async def _run_config(
     }
 
     settings = get_settings()
+    if diagnostic_mode:
+        strategy_config = {
+            "min_confidence": 0.5,
+            "min_expected_move_bps": 5.0,
+            "max_no_trade_score": 0.85,
+            "track_block_reasons": True,
+        }
+    else:
+        strategy_config = {
+            "min_confidence": settings.min_confidence,
+            "min_expected_move_bps": settings.min_expected_move_bps,
+        }
     bt = BacktestEngine(session=session)
     backtest_results = await bt.run(
         name=f"compare-{labels}-{validation_mode}",
@@ -138,10 +151,7 @@ async def _run_config(
         bars_by_symbol=normalized,
         start_date=test_start.date().isoformat(),
         end_date=test_end.date().isoformat(),
-        strategy_config={
-            "min_confidence": settings.min_confidence,
-            "min_expected_move_bps": settings.min_expected_move_bps,
-        },
+        strategy_config=strategy_config,
         risk_config={
             "max_daily_loss": settings.max_daily_loss_usd,
             "max_positions": settings.max_concurrent_positions,
@@ -169,6 +179,11 @@ async def main() -> None:
     parser.add_argument("--purge-bars", type=int, default=75)
     parser.add_argument("--embargo-bars", type=int, default=5)
     parser.add_argument("--train-regime-legacy", action="store_true")
+    parser.add_argument(
+        "--diagnostic",
+        action="store_true",
+        help="Use relaxed thresholds and enable block-reason diagnostics for debugging zero-trade runs",
+    )
     args = parser.parse_args()
 
     settings = get_settings()
@@ -213,6 +228,7 @@ async def main() -> None:
                     purge_bars=args.purge_bars,
                     embargo_bars=args.embargo_bars,
                     train_regime_legacy=args.train_regime_legacy,
+                    diagnostic_mode=args.diagnostic,
                 )
                 await session.commit()
 

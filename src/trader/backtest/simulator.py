@@ -128,6 +128,7 @@ class BacktestSimulator:
             max_position_value=sc.get("max_position_value", 10000.0),
             risk_per_trade_pct=sc.get("risk_per_trade_pct", 0.01),
         )
+        self._track_block_reasons = sc.get("track_block_reasons", False)
         self._strategy = StrategyEngine(
             universe=self._universe,
             sizer=self._sizer,
@@ -135,6 +136,8 @@ class BacktestSimulator:
             min_expected_move_bps=sc.get("min_expected_move_bps", 10.0),
             min_relative_volume=sc.get("min_relative_volume", 0.0),
             max_spread_bps=sc.get("max_spread_bps"),
+            max_no_trade_score=sc.get("max_no_trade_score", 0.5),
+            track_block_reasons=self._track_block_reasons,
         )
         self._risk = RiskEngine(
             max_daily_loss=rc.get("max_daily_loss", 1000.0),
@@ -159,6 +162,7 @@ class BacktestSimulator:
         self._latest_timestamps: dict[str, datetime] = {}
         self._cash = initial_capital
         self._pending_entries: dict[str, TradeIntentParams] = {}
+        self._risk_rejected_count = 0
 
     def run(self, bars_by_symbol: dict[str, list[dict]]) -> dict:
         """Run backtest simulation on historical bars."""
@@ -170,6 +174,9 @@ class BacktestSimulator:
         self._latest_timestamps = {}
         self._cash = self._initial_capital
         self._pending_entries = {}
+        self._risk_rejected_count = 0
+        if self._track_block_reasons:
+            self._strategy.reset_block_stats()
 
         all_bars = self._normalize_bars(bars_by_symbol)
 
@@ -257,6 +264,8 @@ class BacktestSimulator:
 
                 if decision.approved:
                     self._pending_entries[symbol] = intent
+                elif self._track_block_reasons:
+                    self._risk_rejected_count += 1
 
             self._equity_curve.append(self._mark_to_market_equity())
 
@@ -293,7 +302,7 @@ class BacktestSimulator:
                 "profit_factor": symbol_metrics.profit_factor,
             }
 
-        return {
+        result: dict = {
             "total_trades": metrics.total_trades,
             "long_trade_count": metrics.long_trade_count,
             "short_trade_count": metrics.short_trade_count,
@@ -314,6 +323,10 @@ class BacktestSimulator:
             "final_equity": self._equity_curve[-1] if self._equity_curve else self._initial_capital,
             "by_symbol": by_symbol,
         }
+        if self._track_block_reasons:
+            result["strategy_block_reasons"] = self._strategy.get_block_stats()
+            result["risk_rejected_count"] = self._risk_rejected_count
+        return result
 
     def _normalize_bars(self, bars_by_symbol: dict[str, list[dict]]) -> list[tuple[str, BarEvent]]:
         normalized: list[tuple[str, BarEvent]] = []

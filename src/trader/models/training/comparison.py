@@ -57,6 +57,12 @@ def format_comparison_console(reports: list[ComparisonReport]) -> str:
             for k in ("val_score_mean", "val_score_std", "accuracy_mean", "accuracy_std"):
                 if k in report.aggregate:
                     lines.append(f"    {k}: {report.aggregate[k]:.4f}")
+        if "strategy_block_reasons" in bt:
+            lines.append("  [block diagnostics]")
+            for reason, count in sorted(bt["strategy_block_reasons"].items(), key=lambda x: -x[1]):
+                lines.append(f"    {reason}: {count}")
+            if "risk_rejected_count" in bt:
+                lines.append(f"    risk_rejected: {bt['risk_rejected_count']}")
         lines.append("")
 
     if len(reports) >= 2:

@@ -87,6 +87,27 @@ class TestStrategyEngine:
         intent = self.engine.evaluate(pred, Decimal("150.00"), features=_make_features())
         assert intent is None
 
+    def test_short_with_negative_expected_move_uses_abs_for_threshold(self) -> None:
+        """Negative expected_move_bps for shorts should pass when magnitude meets threshold."""
+        pred = _make_prediction(
+            direction="short",
+            expected_move_bps=-25.0,
+            regime="trending_down",
+        )
+        intent = self.engine.evaluate(
+            pred,
+            Decimal("150.00"),
+            features=_make_features(
+                momentum_5m=-0.01,
+                momentum_15m=-0.02,
+                distance_from_vwap=-15.0,
+                orb_breakout_up=0.0,
+                orb_breakout_down=1.0,
+            ),
+        )
+        assert intent is not None
+        assert intent.side == "sell"
+
     def test_skips_high_no_trade_score(self) -> None:
         pred = _make_prediction(no_trade_score=0.8)
         intent = self.engine.evaluate(pred, Decimal("150.00"), features=_make_features())
@@ -203,3 +224,22 @@ class TestStrategyEngine:
 
         assert playbook is not None
         assert playbook["name"] == "vwap_continuation"
+
+    def test_block_stats_tracked_when_enabled(self) -> None:
+        engine = StrategyEngine(
+            universe=self.universe,
+            sizer=self.sizer,
+            min_confidence=0.6,
+            min_expected_move_bps=15.0,
+            min_relative_volume=0.0,
+            track_block_reasons=True,
+        )
+        assert engine.get_block_stats() == {}
+        engine.evaluate(_make_prediction(no_trade_score=0.9), Decimal("150.00"), features=_make_features())
+        engine.evaluate(_make_prediction(no_trade_score=0.9), Decimal("150.00"), features=_make_features())
+        engine.evaluate(_make_prediction(expected_move_bps=3.0), Decimal("150.00"), features=_make_features())
+        stats = engine.get_block_stats()
+        assert stats["filter"] == 2
+        assert stats["low_move"] == 1
+        engine.reset_block_stats()
+        assert engine.get_block_stats() == {}
