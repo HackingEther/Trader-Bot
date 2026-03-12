@@ -23,8 +23,7 @@ class DefaultTradeFilter(TradeFilterModel):
     def predict(self, features: np.ndarray, direction: str, confidence: float) -> float:
         if self._model is not None:
             try:
-                augmented = np.append(features, [confidence])
-                pred = self._model.predict_proba(augmented.reshape(1, -1))[0]  # type: ignore[union-attr]
+                pred = self._model.predict_proba(features.reshape(1, -1))[0]  # type: ignore[union-attr]
                 return float(pred[1]) if len(pred) > 1 else float(pred[0])
             except Exception as e:
                 logger.warning("filter_model_predict_error", error=str(e))
