@@ -9,9 +9,14 @@ import numpy as np
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from trader.db.models.training_run import TrainingRun
 from trader.config import get_settings
+from trader.db.models.training_run import TrainingRun
 from trader.models.registry import ModelRegistry
+from trader.models.training.walkforward import (
+    WalkForwardMetrics,
+    WalkForwardSplitter,
+    compute_trading_metrics,
+)
 from trader.providers.artifacts.local import LocalArtifactStore
 from trader.services.model_loader import build_model_metadata
 
@@ -125,6 +130,141 @@ class TrainingPipeline:
                 promoted=promote,
             )
 
+        except Exception as e:
+            run.status = "failed"
+            run.completed_at = datetime.now(timezone.utc)
+            run.error_message = str(e)
+            logger.error("training_failed", run_id=run.id, error=str(e))
+
+        await self._session.flush()
+        return run
+
+    async def run_walkforward(
+        self,
+        model_type: str,
+        features: np.ndarray,
+        labels: np.ndarray,
+        timestamps: list | None = None,
+        *,
+        n_folds: int = 5,
+        purge_bars: int = 75,
+        embargo_bars: int = 5,
+        min_train_pct: float = 0.5,
+        hyperparameters: dict | None = None,
+        version: str | None = None,
+        promote: bool = False,
+        notes: str = "",
+        magnitude_labels: np.ndarray | None = None,
+    ) -> TrainingRun:
+        """Execute training with walk-forward validation and purge/embargo.
+
+        Reports fold-by-fold metrics and aggregate. Final model trained on all data.
+        """
+        params = hyperparameters or {}
+        now = datetime.now(timezone.utc)
+        resolved_version = version or f"{model_type}-wf-{now.strftime('%Y%m%d%H%M%S')}"
+
+        run = TrainingRun(
+            model_type=model_type,
+            status="running",
+            started_at=now,
+            hyperparameters={**params, "n_folds": n_folds, "purge_bars": purge_bars, "embargo_bars": embargo_bars},
+            training_samples=len(features),
+            notes=notes,
+        )
+        self._session.add(run)
+        await self._session.flush()
+
+        wf_metrics = WalkForwardMetrics()
+        splitter = WalkForwardSplitter(
+            n_folds=n_folds,
+            min_train_pct=min_train_pct,
+            purge_bars=purge_bars,
+            embargo_bars=embargo_bars,
+        )
+        folds = splitter.get_folds(len(features), timestamps)
+
+        if not folds:
+            run.status = "failed"
+            run.completed_at = datetime.now(timezone.utc)
+            run.error_message = "No walk-forward folds generated"
+            await self._session.flush()
+            return run
+
+        try:
+            for fold in folds:
+                x_train = features[fold.train_indices]
+                y_train = labels[fold.train_indices]
+                x_val = features[fold.val_indices]
+                y_val = labels[fold.val_indices]
+
+                if model_type in ("regime", "direction", "filter"):
+                    model_fold, fold_m, _ = self._train_classifier(x_train, y_train, x_val, y_val, params)
+                    y_pred = model_fold.predict(x_val)
+                else:
+                    model_fold, fold_m, _ = self._train_regressor(x_train, y_train, x_val, y_val, params)
+                    y_pred = model_fold.predict(x_val)
+
+                trading_m = {}
+                if model_type in ("regime", "direction", "filter"):
+                    trading_m = compute_trading_metrics(y_val, y_pred)
+                wf_metrics.add_fold(fold.fold_id, {**fold_m, **trading_m})
+
+            wf_metrics.compute_aggregate()
+
+            x_train_full = features
+            y_train_full = labels
+            if model_type in ("regime", "direction", "filter"):
+                model, final_m, algorithm = self._train_classifier(
+                    x_train_full, y_train_full, x_train_full, y_train_full, params
+                )
+            else:
+                model, final_m, algorithm = self._train_regressor(
+                    x_train_full, y_train_full, x_train_full, y_train_full, params
+                )
+
+            artifact_key = f"models/{resolved_version}/{model_type}.pkl"
+            artifact_path = await self._artifact_store.save(artifact_key, pickle.dumps(model))
+
+            run.status = "completed"
+            run.completed_at = datetime.now(timezone.utc)
+            run.validation_samples = sum(len(f.val_indices) for f in folds)
+            run.metrics = {
+                "fold_metrics": wf_metrics.fold_metrics,
+                "aggregate": wf_metrics.aggregate,
+                "final_train": final_m,
+            }
+            run.best_score = wf_metrics.aggregate.get("val_score_mean", final_m.get("val_score", 0.0))
+            run.artifact_path = artifact_path
+
+            model_version = await self._registry.register(
+                model_type=model_type,
+                version=resolved_version,
+                artifact_path=artifact_path,
+                algorithm=algorithm,
+                hyperparameters={
+                    **params,
+                    **build_model_metadata(
+                        model_type=model_type,
+                        version=resolved_version,
+                        training_run_id=run.id,
+                    ),
+                },
+                metrics=run.metrics,
+                training_run_id=run.id,
+                score=run.best_score,
+            )
+            if promote:
+                await self._registry.promote_to_champion(model_version.id)
+
+            logger.info(
+                "training_walkforward_completed",
+                run_id=run.id,
+                model_type=model_type,
+                version=resolved_version,
+                n_folds=len(folds),
+                aggregate=wf_metrics.aggregate,
+            )
         except Exception as e:
             run.status = "failed"
             run.completed_at = datetime.now(timezone.utc)

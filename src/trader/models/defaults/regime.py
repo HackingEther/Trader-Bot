@@ -1,4 +1,4 @@
-"""Default regime classifier using LightGBM/sklearn."""
+"""Default regime classifier using deterministic logic."""
 
 from __future__ import annotations
 
@@ -8,7 +8,9 @@ from pathlib import Path
 import numpy as np
 import structlog
 
+from trader.features.registry import get_feature_names
 from trader.models.interfaces import RegimeClassifier
+from trader.models.training.dataset import infer_regime
 
 logger = structlog.get_logger(__name__)
 
@@ -16,11 +18,15 @@ REGIMES = ["trending_up", "trending_down", "mean_reverting", "high_volatility", 
 
 
 class DefaultRegimeClassifier(RegimeClassifier):
-    """Default regime classifier with heuristic fallback."""
+    """Deterministic regime classifier. Uses infer_regime(features) - no ML model.
+
+    Regime is a rule over rolling_volatility_20 and momentum_15m. Keeps load()
+    for backward compatibility with existing champion artifacts.
+    """
 
     def __init__(self) -> None:
         self._model: object | None = None
-        self._version = "default-v1"
+        self._version = "deterministic-v1"
 
     def predict(self, features: np.ndarray) -> tuple[str, float]:
         if self._model is not None:
@@ -31,25 +37,9 @@ class DefaultRegimeClassifier(RegimeClassifier):
             except Exception as e:
                 logger.warning("regime_model_predict_error", error=str(e))
 
-        return self._heuristic(features)
-
-    def _heuristic(self, features: np.ndarray) -> tuple[str, float]:
-        """Simple heuristic based on volatility and momentum features."""
-        if len(features) < 5:
-            return "low_volatility", 0.5
-
-        vol_20 = features[3] if len(features) > 3 else 0.0
-        ret_15m = features[2] if len(features) > 2 else 0.0
-
-        if vol_20 > 0.02:
-            return "high_volatility", 0.6
-        if ret_15m > 0.005:
-            return "trending_up", 0.55
-        if ret_15m < -0.005:
-            return "trending_down", 0.55
-        if vol_20 < 0.005:
-            return "low_volatility", 0.6
-        return "mean_reverting", 0.5
+        features_dict = dict(zip(get_feature_names(), features.flatten(), strict=False))
+        regime = infer_regime(features_dict)
+        return regime, 0.9
 
     def load(self, path: str) -> None:
         p = Path(path)

@@ -266,34 +266,45 @@ class BacktestSimulator:
 
     def get_results(self) -> dict:
         """Get backtest results summary."""
-        from trader.backtest.metrics import compute_metrics
+        from trader.backtest.metrics import compute_metrics_from_trades
 
-        trade_pnls = [t.pnl for t in self._closed_trades]
-        hold_mins = [t.hold_minutes for t in self._closed_trades]
-        metrics = compute_metrics(trade_pnls, hold_mins, self._equity_curve, self._initial_capital)
+        metrics = compute_metrics_from_trades(
+            self._closed_trades,
+            self._equity_curve,
+            self._initial_capital,
+        )
         by_symbol: dict[str, dict] = {}
         for symbol in self._symbols:
             symbol_trades = [t for t in self._closed_trades if t.symbol == symbol]
-            symbol_metrics = compute_metrics(
-                [t.pnl for t in symbol_trades],
-                [t.hold_minutes for t in symbol_trades],
+            symbol_metrics = compute_metrics_from_trades(
+                symbol_trades,
                 self._equity_curve,
                 self._initial_capital,
             )
             by_symbol[symbol] = {
                 "total_trades": symbol_metrics.total_trades,
+                "long_trade_count": symbol_metrics.long_trade_count,
+                "short_trade_count": symbol_metrics.short_trade_count,
                 "total_pnl": symbol_metrics.total_pnl,
                 "win_rate": symbol_metrics.win_rate,
+                "loss_rate": symbol_metrics.loss_rate,
+                "expectancy": symbol_metrics.expectancy,
+                "average_net_pnl_bps": symbol_metrics.average_net_pnl_bps,
                 "profit_factor": symbol_metrics.profit_factor,
             }
 
         return {
             "total_trades": metrics.total_trades,
+            "long_trade_count": metrics.long_trade_count,
+            "short_trade_count": metrics.short_trade_count,
             "win_count": metrics.win_count,
             "loss_count": metrics.loss_count,
             "total_pnl": metrics.total_pnl,
             "win_rate": metrics.win_rate,
+            "loss_rate": metrics.loss_rate,
             "expectancy": metrics.expectancy,
+            "average_net_pnl_bps": metrics.average_net_pnl_bps,
+            "median_net_pnl_bps": metrics.median_net_pnl_bps,
             "sharpe_ratio": metrics.sharpe_ratio,
             "max_drawdown": metrics.max_drawdown,
             "profit_factor": metrics.profit_factor,

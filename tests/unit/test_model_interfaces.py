@@ -44,7 +44,7 @@ class TestDefaultModels:
         assert 0 <= score <= 1
 
     def test_model_versions(self) -> None:
-        assert DefaultRegimeClassifier().version == "default-v1"
+        assert DefaultRegimeClassifier().version == "deterministic-v1"
         assert DefaultDirectionClassifier().version == "default-v1"
         assert DefaultMagnitudeRegressor().version == "default-v1"
         assert DefaultTradeFilter().version == "default-v1"
