@@ -63,6 +63,7 @@ async def _run_config(
     embargo_bars: int,
     train_regime_legacy: bool,
     diagnostic_mode: bool = False,
+    initial_capital: float = 100000.0,
 ) -> tuple[dict, dict, list[dict] | None, dict | None]:
     """Train models and run backtest. Returns (training_metrics, backtest_metrics, fold_metrics, aggregate)."""
     if labels == "tradable":
@@ -140,6 +141,8 @@ async def _run_config(
             "track_block_reasons": True,
             "funnel_audit": True,
             "framework": f"{labels}_{validation_mode}",
+            "max_position_value": settings.max_exposure_per_symbol_usd,
+            "risk_per_trade_pct": 0.01,
         }
     else:
         strategy_config = {
@@ -148,6 +151,8 @@ async def _run_config(
             "track_block_reasons": True,
             "funnel_audit": True,
             "framework": f"{labels}_{validation_mode}",
+            "max_position_value": settings.max_exposure_per_symbol_usd,
+            "risk_per_trade_pct": 0.01,
         }
     bt = BacktestEngine(session=session)
     backtest_results = await bt.run(
@@ -159,9 +164,13 @@ async def _run_config(
         strategy_config=strategy_config,
         risk_config={
             "max_daily_loss": settings.max_daily_loss_usd,
+            "max_loss_per_trade": settings.max_loss_per_trade_usd,
             "max_positions": settings.max_concurrent_positions,
             "max_notional": settings.max_notional_exposure_usd,
+            "max_per_symbol": settings.max_exposure_per_symbol_usd,
+            "cooldown_losses": settings.cooldown_after_losses,
         },
+        initial_capital=initial_capital,
         use_champion_models=True,
     )
 
@@ -189,9 +198,16 @@ async def main() -> None:
         action="store_true",
         help="Use relaxed thresholds and enable block-reason diagnostics for debugging zero-trade runs",
     )
+    parser.add_argument(
+        "--initial-capital",
+        type=float,
+        default=None,
+        help="Backtest starting capital. Defaults to paper_initial_cash from config. Use same value as your paper/live account for aligned sizing and risk.",
+    )
     args = parser.parse_args()
 
     settings = get_settings()
+    initial_capital = args.initial_capital if args.initial_capital is not None else settings.paper_initial_cash
     engine = create_async_engine(settings.database_url)
     factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
@@ -232,8 +248,9 @@ async def main() -> None:
                     n_folds=args.n_folds,
                     purge_bars=args.purge_bars,
                     embargo_bars=args.embargo_bars,
-                    train_regime_legacy=args.train_regime_legacy,
-                    diagnostic_mode=args.diagnostic,
+                train_regime_legacy=args.train_regime_legacy,
+                diagnostic_mode=args.diagnostic,
+                initial_capital=initial_capital,
                 )
                 await session.commit()
 
