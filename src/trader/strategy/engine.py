@@ -71,11 +71,15 @@ class StrategyEngine:
         use_marketable_limits: bool = True,
         marketable_limit_buffer_bps: float = 5.0,
         funnel_tracker: DecisionFunnelTracker | None = None,
+        magnitude_is_net_edge: bool = False,
+        min_expected_net_edge_bps: float = 8.0,
     ) -> None:
         self._universe = universe
         self._sizer = sizer
         self._min_confidence = min_confidence
         self._min_expected_move_bps = min_expected_move_bps
+        self._magnitude_is_net_edge = magnitude_is_net_edge
+        self._min_expected_net_edge_bps = min_expected_net_edge_bps
         self._min_relative_volume = min_relative_volume
         self._max_spread_bps = max_spread_bps
         self._limit_entry_buffer_bps = limit_entry_buffer_bps
@@ -317,7 +321,12 @@ class StrategyEngine:
         relative_volume: float,
         spread_bps: float | None,
     ) -> float:
-        threshold = self._min_expected_move_bps
+        base = (
+            self._min_expected_net_edge_bps
+            if self._magnitude_is_net_edge
+            else self._min_expected_move_bps
+        )
+        threshold = base
         if regime == "high_volatility":
             threshold += 8.0
         elif regime.startswith("trending"):
@@ -412,14 +421,19 @@ class StrategyEngine:
         orb_fit = time_orb * vol_orb * align_orb
         scores.append(("orb_continuation", orb_fit))
 
-        regime_cont = 1.0 if prediction.regime in {"trending_up", "trending_down", "high_volatility"} else 0.0
-        min_rv_cont = max(0.9, self._min_relative_volume)
-        vol_cont = min(1.0, relative_volume / min_rv_cont) if min_rv_cont > 0 else 1.0
         long_cont = momentum_5m > 0 and momentum_15m > 0 and distance_from_vwap >= 0
         short_cont = momentum_5m < 0 and momentum_15m < 0 and distance_from_vwap <= 0
         align_cont = 1.0 if (
             (prediction.direction == "long" and long_cont) or (prediction.direction == "short" and short_cont)
         ) else 0.0
+        if prediction.regime in {"trending_up", "trending_down", "high_volatility"}:
+            regime_cont = 1.0
+        elif prediction.regime in {"mean_reverting", "low_volatility"} and align_cont > 0:
+            regime_cont = 0.5
+        else:
+            regime_cont = 0.0
+        min_rv_cont = max(0.9, self._min_relative_volume)
+        vol_cont = min(1.0, relative_volume / min_rv_cont) if min_rv_cont > 0 else 1.0
         cont_fit = regime_cont * vol_cont * align_cont
         scores.append(("vwap_continuation", cont_fit))
 

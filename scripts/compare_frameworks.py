@@ -133,6 +133,7 @@ async def _run_config(
     }
 
     settings = get_settings()
+    magnitude_is_net_edge = labels == "tradable"
     if diagnostic_mode:
         strategy_config = {
             "min_confidence": 0.5,
@@ -141,6 +142,7 @@ async def _run_config(
             "track_block_reasons": True,
             "funnel_audit": True,
             "framework": f"{labels}_{validation_mode}",
+            "magnitude_is_net_edge": magnitude_is_net_edge,
             "max_position_value": settings.max_exposure_per_symbol_usd,
             "risk_per_trade_pct": 0.01,
         }
@@ -151,6 +153,7 @@ async def _run_config(
             "track_block_reasons": True,
             "funnel_audit": True,
             "framework": f"{labels}_{validation_mode}",
+            "magnitude_is_net_edge": magnitude_is_net_edge,
             "max_position_value": settings.max_exposure_per_symbol_usd,
             "risk_per_trade_pct": 0.01,
         }

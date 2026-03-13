@@ -343,3 +343,47 @@ def test_backtest_decision_funnel_in_results_when_funnel_audit() -> None:
     assert "total_by_reason" in funnel
     assert "by_framework_symbol_side" in funnel
     assert "event_count" in funnel
+
+
+def test_backtest_funnel_includes_distributions() -> None:
+    """When funnel_audit=True, decision_funnel includes block_distributions with percentiles."""
+    low_conf = ModelPrediction(
+        symbol="AAPL",
+        timestamp=datetime.now(timezone.utc),
+        direction="long",
+        confidence=0.4,
+        expected_move_bps=30.0,
+        expected_holding_minutes=1.0,
+        no_trade_score=0.1,
+        regime="trending_up",
+    )
+    bars = _bars(100.0, [0.2] * 25)
+    simulator = BacktestSimulator(
+        symbols=["AAPL"],
+        strategy_config={
+            "min_history_bars": 16,
+            "min_confidence": 0.6,
+            "min_expected_move_bps": 0.0,
+            "min_relative_volume": 0.0,
+            "max_position_value": 101.0,
+            "risk_per_trade_pct": 1.0,
+            "funnel_audit": True,
+            "framework": "test_fw",
+        },
+        slippage=SlippageModel(fixed_bps=0.0),
+        commission=CommissionModel(),
+        initial_capital=1000.0,
+        ensemble=_SequencedEnsemble([low_conf] * 5),
+    )
+
+    results = simulator.run({"AAPL": bars})
+
+    assert "decision_funnel" in results
+    funnel = results["decision_funnel"]
+    assert "block_distributions" in funnel
+    dist = funnel["block_distributions"]
+    assert isinstance(dist, dict)
+    key = "test_fw|AAPL|long"
+    if key in dist and "low_confidence" in dist[key]:
+        conf_dist = dist[key]["low_confidence"].get("confidence", {})
+        assert "p10" in conf_dist or "p50" in conf_dist or "p90" in conf_dist

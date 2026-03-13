@@ -136,6 +136,10 @@ class BacktestSimulator:
         self._funnel_tracker: DecisionFunnelTracker | None = None
         if self._track_block_reasons or self._funnel_audit:
             self._funnel_tracker = DecisionFunnelTracker(framework=self._framework)
+        magnitude_is_net_edge = sc.get(
+            "magnitude_is_net_edge",
+            "tradable" in str(sc.get("framework", "")),
+        )
         self._strategy = StrategyEngine(
             universe=self._universe,
             sizer=self._sizer,
@@ -148,6 +152,8 @@ class BacktestSimulator:
             min_playbook_fit=sc.get("min_playbook_fit", 0.4),
             track_block_reasons=self._track_block_reasons,
             funnel_tracker=self._funnel_tracker,
+            magnitude_is_net_edge=magnitude_is_net_edge,
+            min_expected_net_edge_bps=sc.get("min_expected_net_edge_bps", 8.0),
         )
         self._risk = RiskEngine(
             max_daily_loss=rc.get("max_daily_loss", 1000.0),
@@ -358,7 +364,9 @@ class BacktestSimulator:
             result["strategy_block_reasons"] = self._strategy.get_block_stats()
             result["risk_rejected_count"] = self._risk_rejected_count
         if self._funnel_tracker is not None:
-            result["decision_funnel"] = self._funnel_tracker.get_summary()
+            funnel_summary = self._funnel_tracker.get_summary()
+            funnel_summary.update(self._funnel_tracker.get_distribution_summary())
+            result["decision_funnel"] = funnel_summary
         return result
 
     def _benchmark_returns_at(

@@ -218,10 +218,16 @@ class TestStrategyEngine:
         assert playbook is not None
         assert playbook["name"] == "vwap_continuation"
 
-    def test_select_playbook_rejects_trend_setup_when_regime_mismatches(self) -> None:
+    def test_select_playbook_rejects_trend_setup_when_regime_and_momentum_mismatch(self) -> None:
+        """No playbook when regime is mean_reverting and momentum does not align (e.g. below vwap for long)."""
         playbook, _, _ = self.engine._select_playbook(
             prediction=_make_prediction(direction="long", regime="mean_reverting"),
-            features=_make_features(minutes_since_open=61.0),
+            features=_make_features(
+                minutes_since_open=61.0,
+                distance_from_vwap=-35.0,
+                momentum_5m=0.01,
+                momentum_15m=0.02,
+            ),
             spread_bps=10.0,
         )
 
@@ -288,3 +294,55 @@ class TestStrategyEngine:
         assert stats["low_move"] == 1
         engine.reset_block_stats()
         assert engine.get_block_stats() == {}
+
+    def test_net_edge_threshold_used_when_enabled(self) -> None:
+        """When magnitude_is_net_edge=True, use min_expected_net_edge_bps for move check."""
+        engine_net = StrategyEngine(
+            universe=self.universe,
+            sizer=self.sizer,
+            min_confidence=0.6,
+            min_expected_move_bps=15.0,
+            min_expected_net_edge_bps=8.0,
+            magnitude_is_net_edge=True,
+            min_relative_volume=0.0,
+        )
+        pred_10_bps = _make_prediction(expected_move_bps=10.0)
+        intent = engine_net.evaluate(pred_10_bps, Decimal("150.00"), features=_make_features())
+        assert intent is not None
+
+        engine_raw = StrategyEngine(
+            universe=self.universe,
+            sizer=self.sizer,
+            min_confidence=0.6,
+            min_expected_move_bps=15.0,
+            magnitude_is_net_edge=False,
+            min_relative_volume=0.0,
+        )
+        intent_raw = engine_raw.evaluate(pred_10_bps, Decimal("150.00"), features=_make_features())
+        assert intent_raw is None
+
+    def test_playbook_partial_credit_low_vol_momentum(self) -> None:
+        """vwap_continuation gets partial score (0.5) in low_vol/mean_rev when momentum aligns."""
+        engine = StrategyEngine(
+            universe=self.universe,
+            sizer=self.sizer,
+            min_confidence=0.6,
+            min_expected_move_bps=15.0,
+            min_relative_volume=0.0,
+        )
+        playbook, fit, _ = engine._select_playbook(
+            prediction=_make_prediction(direction="long", regime="mean_reverting"),
+            features=_make_features(
+                minutes_since_open=90.0,
+                momentum_5m=0.01,
+                momentum_15m=0.02,
+                distance_from_vwap=15.0,
+                relative_volume=1.2,
+                orb_breakout_up=0.0,
+                orb_breakout_down=0.0,
+            ),
+            spread_bps=10.0,
+        )
+        assert playbook is not None
+        assert playbook["name"] == "vwap_continuation"
+        assert fit >= 0.4
